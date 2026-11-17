@@ -1,0 +1,5 @@
+[
+  {"id": 1, "name": "nightly", "state": "active"},
+  {"id": 2, "name": "lint", "state": "active"},
+  {"id": 3, "name": "legacy", "state": "disabled_manually"}
+]

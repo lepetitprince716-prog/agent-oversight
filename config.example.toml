@@ -1,0 +1,27 @@
+# Copy to ~/.config/agent-oversight/config.toml (or pass --config / set OVERSIGHT_CONFIG).
+
+lang = "en"                      # language of the digest: "en" or "zh"
+
+[tracker]
+dir = "~/tasks"                  # required; passed to the tracker as `bd -C <dir>`
+# command = ["bd"]
+# blocker_markers = ["blocker:", "卡点："]
+
+[github]
+# command = ["gh"]
+# timeout_seconds = 30
+
+[thresholds]
+# quiet_days = 2                 # in-progress task, or local-only branch, with no update for longer than this
+# pr_days = 3                    # open pull request with no update for longer than this
+
+# One table per repository. The key is the <name> in the task label `repo:<name>`.
+[repos.widgets]
+github = "acme/widgets"
+# scheduled = true               # also watch the repository's scheduled CI runs
+# path = "~/code/widgets"        # top folder of the local clone: report branches whose commits exist only here
+# public = false                 # public or public-bound: report a clone without an executable pre-push hook
+
+[repos.gadgets]
+github = "acme/gadgets"
+scheduled = false

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "task-p5q6",
+    "title": "Write the release notes",
+    "status": "in_progress",
+    "labels": ["repo:widgets"],
+    "assignee": "agent-1",
+    "updated_at": "2026-11-17T09:00:00Z"
+  }
+]

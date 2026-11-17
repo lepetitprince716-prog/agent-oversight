@@ -1,0 +1,9 @@
+lang = "en"
+
+[tracker]
+dir = "~/tasks"
+
+[repos.widgets]
+github = "acme/widgets"
+path = "~/code/widgets"
+public = true

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the privacy scan reads the whole history
+          persist-credentials: false
+      - name: Tests
+        run: python3 -B -m unittest discover -s tests
+      - name: Privacy scan of the tree and the whole history
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          scanner=tools/privacy_scan.py
+          rules=tools/privacy_rules.json
+          if [ -n "$BASE_REF" ]; then
+            # On a pull request the scanner and its rules come from the base branch,
+            # so a change cannot loosen the rules it is judged by. This file runs as
+            # the pull request has it: read a change to it before merging.
+            git show "origin/$BASE_REF:tools/privacy_scan.py" > "$RUNNER_TEMP/privacy_scan.py"
+            git show "origin/$BASE_REF:tools/privacy_rules.json" > "$RUNNER_TEMP/privacy_rules.json"
+            scanner="$RUNNER_TEMP/privacy_scan.py"
+            rules="$RUNNER_TEMP/privacy_rules.json"
+          fi
+          python3 -B "$scanner" --rules "$rules" --tracked --history

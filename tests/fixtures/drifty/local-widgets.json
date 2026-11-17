@@ -1,0 +1,8 @@
+{
+  "branches": [
+    {"name": "fix/retry-budget", "only_here": 3, "tip": "2026-11-10T08:00:00Z"},
+    {"name": "wip/parser", "only_here": 1, "tip": "2026-11-16T20:00:00Z"},
+    {"name": "main", "only_here": 0, "tip": "2026-11-09T08:00:00Z"}
+  ],
+  "pre_push_hook": false
+}

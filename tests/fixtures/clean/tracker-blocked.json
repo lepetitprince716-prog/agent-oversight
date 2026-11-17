@@ -1,0 +1,10 @@
+[
+  {
+    "id": "task-m3n4",
+    "title": "Choose the retry policy",
+    "status": "blocked",
+    "labels": ["repo:widgets", "wait:decision"],
+    "notes": "blocker: decide between fixed and exponential backoff",
+    "updated_at": "2026-11-16T09:00:00Z"
+  }
+]

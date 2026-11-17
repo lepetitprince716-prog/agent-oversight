@@ -1,0 +1,6 @@
+{
+  "branches": [
+    {"name": "main", "only_here": 0, "tip": "2026-11-16T08:00:00Z"}
+  ],
+  "pre_push_hook": true
+}

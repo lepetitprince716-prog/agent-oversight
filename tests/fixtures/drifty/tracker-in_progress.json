@@ -1,0 +1,18 @@
+[
+  {
+    "id": "task-i9j0",
+    "title": "Migrate the build script",
+    "status": "in_progress",
+    "labels": ["repo:widgets"],
+    "assignee": "agent-3",
+    "updated_at": "2026-11-10T12:00:00Z"
+  },
+  {
+    "id": "task-k1l2",
+    "title": "Document the CLI flags",
+    "status": "in_progress",
+    "labels": ["repo:gadgets"],
+    "assignee": "agent-4",
+    "updated_at": "2026-11-17T08:00:00Z"
+  }
+]

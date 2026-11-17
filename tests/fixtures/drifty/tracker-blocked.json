@@ -1,0 +1,37 @@
+[
+  {
+    "id": "task-a1b2",
+    "title": "Retry uploads on timeout",
+    "status": "blocked",
+    "labels": ["repo:widgets", "wait:review"],
+    "assignee": "agent-1",
+    "notes": "Implemented.\nblocker: waiting for you to merge PR #12 | next: close the task",
+    "updated_at": "2026-11-05T09:00:00Z",
+    "priority": 2
+  },
+  {
+    "id": "task-c3d4",
+    "title": "Cache the schema lookup",
+    "status": "blocked",
+    "labels": ["repo:widgets", "wait:decision"],
+    "assignee": "agent-2",
+    "notes": "卡点：等你合并 PR #14｜下一步：close the task",
+    "updated_at": "2026-11-10T15:30:00Z"
+  },
+  {
+    "id": "task-e5f6",
+    "title": "Rename the config keys",
+    "status": "blocked",
+    "labels": ["repo:widgets"],
+    "notes": "Parked for now.",
+    "updated_at": "2026-11-12T08:00:00Z"
+  },
+  {
+    "id": "task-g7h8",
+    "title": "Add a health endpoint",
+    "status": "blocked",
+    "labels": ["repo:gadgets", "wait:notice"],
+    "notes": "blocker: PR #30 must land first",
+    "updated_at": "2026-11-14T18:45:00Z"
+  }
+]
