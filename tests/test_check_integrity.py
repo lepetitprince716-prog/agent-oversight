@@ -2824,5 +2824,284 @@ class LintConfigLoosened(RepoCase):
         self.assertNotIn("lint-config", rules.classes_of("pyproject.toml"))
 
 
+SHA_OLD = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+SHA_NEW = "0123456789abcdef0123456789abcdef01234567"
+DIGEST_OLD = "a1" * 32
+DIGEST_NEW = "b2" * 32
+VERSIONED_WORKFLOW = (
+    "name: ci\n"
+    "on: push\n"
+    "jobs:\n"
+    "  test:\n"
+    "    runs-on: ubuntu-24.04\n"
+    "    container: python:3.12.1\n"
+    "    timeout-minutes: 10\n"
+    "    steps:\n"
+    f"      - uses: actions/checkout@{SHA_OLD} # v7.0.1\n"
+    "      - uses: actions/setup-python@v5\n"
+    "        with:\n"
+    "          python-version: ['3.11', '3.12']\n"
+    "      - uses: actions/setup-node@v4\n"
+    "        with:\n"
+    "          node-version: 20\n"
+    "      - uses: github/codeql-action/analyze@v3.25.1\n"
+    "      - run: python -m pytest --cov-fail-under=90\n"
+    "    services:\n"
+    "      db:\n"
+    f"        image: postgres:15@sha256:{DIGEST_OLD}\n"
+)
+VERSIONED_HOOKS = (
+    "repos:\n"
+    "  - repo: https://example.com/hooks\n"
+    "    rev: v1.2.3\n"
+    "    hooks:\n"
+    "      - id: check\n"
+    "  - repo: https://example.com/more\n"
+    f"    rev: {SHA_OLD}\n"
+    "    hooks:\n"
+    "      - id: more\n"
+)
+VERSION_RULE = "version-bumped"
+WORKFLOW_PATH = ".github/workflows/ci.yml"
+HOOKS_PATH = ".pre-commit-config.yaml"
+
+
+class VersionBumps(RepoCase):
+    """A change that only moves version numbers on the version lines of a CI file is a note, not
+    a block: bots (Dependabot, pre-commit autoupdate) cannot write a reason line. Every other
+    change to the same lines, and every other number, stays a finding."""
+
+    def setUp(self):
+        super().setUp()
+        self.put("Seed", **{WORKFLOW_PATH: VERSIONED_WORKFLOW, HOOKS_PATH: VERSIONED_HOOKS})
+
+    def put(self, message, **files):
+        for path, content in files.items():
+            self.repo.write(path, content)
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", message)
+
+    @staticmethod
+    def edited(text, *pairs):
+        for old, new in pairs:
+            assert old in text, old
+            text = text.replace(old, new, 1)
+        return text
+
+    def findings(self, *args):
+        code, out, err = self.repo.scan(*(args or ("--commit", "HEAD")), "--json")
+        self.assertIn(code, (0, 1), out + err)
+        found = [(f["path"], f["line"], f["rule"], f["severity"], f["justified"]) for f in json.loads(out)["findings"]]
+        return code, found
+
+    def workflow_change(self, *pairs):
+        self.put("Edit the workflow", **{WORKFLOW_PATH: self.edited(VERSIONED_WORKFLOW, *pairs)})
+        return self.findings()
+
+    def test_a_pinned_action_moved_to_a_new_sha_and_version_comment_is_a_note(self):
+        code, found = self.workflow_change((f"actions/checkout@{SHA_OLD} # v7.0.1", f"actions/checkout@{SHA_NEW} # v7.0.2"))
+        self.assertEqual((code, [(p, r, s) for p, _, r, s, _ in found]), (0, [(WORKFLOW_PATH, VERSION_RULE, "note")]))
+
+    def test_a_runner_and_a_python_version_bump_together_are_one_note(self):
+        code, found = self.workflow_change(
+            ("runs-on: ubuntu-24.04", "runs-on: ubuntu-26.04"),
+            ("['3.11', '3.12']", "['3.12', '3.13']"),
+        )
+        self.assertEqual((code, [(p, r, s) for p, _, r, s, _ in found]), (0, [(WORKFLOW_PATH, VERSION_RULE, "note")]))
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines()[-1], "check-integrity: ok (1 commits, 1 files, 1 note(s), not blocking)")
+
+    def test_each_kind_of_version_line_bumped_alone_is_a_note(self):
+        cases = {
+            "uses tag": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("setup-python@v5", "setup-python@v6")]),
+            "uses with a path": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("analyze@v3.25.1", "analyze@v3.26.0")]),
+            "runs-on": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("ubuntu-24.04", "ubuntu-26.04")]),
+            "container": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("python:3.12.1", "python:3.13.0")]),
+            "image with a digest": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("postgres:15@sha256:" + DIGEST_OLD, "postgres:16@sha256:" + DIGEST_NEW)]),
+            "a -version key with a number": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("node-version: 20", "node-version: 22")]),
+            "a -version key with a list": (WORKFLOW_PATH, VERSIONED_WORKFLOW, [("['3.11', '3.12']", "['3.12', '3.13']")]),
+            "pre-commit rev tag": (HOOKS_PATH, VERSIONED_HOOKS, [("rev: v1.2.3", "rev: v1.3.0")]),
+            "pre-commit rev sha": (HOOKS_PATH, VERSIONED_HOOKS, [(f"rev: {SHA_OLD}", f"rev: {SHA_NEW}")]),
+        }
+        for name, (path, base, pairs) in cases.items():
+            with self.subTest(name):
+                self.put("Bump", **{path: self.edited(base, *pairs)})
+                code, found = self.findings()
+                self.assertEqual((code, [(p, r, s) for p, _, r, s, _ in found]), (0, [(path, VERSION_RULE, "note")]))
+                self.put("Back", **{path: base})
+
+    def test_two_files_of_bumps_give_one_note_each(self):
+        self.put(
+            "Bump both",
+            **{
+                WORKFLOW_PATH: self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04")),
+                HOOKS_PATH: self.edited(VERSIONED_HOOKS, ("rev: v1.2.3", "rev: v1.3.0")),
+            },
+        )
+        code, found = self.findings()
+        self.assertEqual((code, sorted((p, r) for p, _, r, _, _ in found)), (0, [(WORKFLOW_PATH, VERSION_RULE), (HOOKS_PATH, VERSION_RULE)]))
+
+    def test_the_bump_is_a_note_on_the_hunks_it_has_even_when_far_apart(self):
+        code, found = self.workflow_change(
+            ("ubuntu-24.04", "ubuntu-26.04"), ("node-version: 20", "node-version: 22"), (f"postgres:15@sha256:{DIGEST_OLD}", f"postgres:16@sha256:{DIGEST_OLD}")
+        )
+        self.assertEqual((code, [r for _, _, r, _, _ in found]), (0, [VERSION_RULE]))
+
+    def test_other_changes_to_the_same_lines_stay_blocking(self):
+        cases = {
+            "coverage floor to 0": [("--cov-fail-under=90", "--cov-fail-under=0")],
+            "timeout to 0": [("timeout-minutes: 10", "timeout-minutes: 0")],
+            "another repository's action": [(f"actions/checkout@{SHA_OLD} # v7.0.1", f"evil/checkout@{SHA_NEW} # v7.0.2")],
+            "another path in the same repository": [("codeql-action/analyze@v3.25.1", "codeql-action/upload-sarif@v3.25.2")],
+            "a matrix with a cell fewer": [("['3.11', '3.12']", "['3.12']")],
+            "a matrix with a cell more": [("['3.11', '3.12']", "['3.11', '3.12', '3.13']")],
+            "another key": [("python-version: ['3.11', '3.12']", "node-version: ['3.11', '3.12']")],
+            "a runner that is not a version": [("ubuntu-24.04", "self-hosted")],
+            "a tag that becomes a branch": [("setup-python@v5", "setup-python@main")],
+            "a comment that grows": [(f"actions/checkout@{SHA_OLD} # v7.0.1", f"actions/checkout@{SHA_OLD} # v7.0.1 skip")],
+            "a short sha": [(f"actions/checkout@{SHA_OLD}", "actions/checkout@0123456")],
+            "an image with another name": [("postgres:15@", "mysql:15@")],
+        }
+        for name, pairs in cases.items():
+            with self.subTest(name):
+                code, found = self.workflow_change(*pairs)
+                rules = {r for _, _, r, _, _ in found}
+                self.assertEqual(code, 1, found)
+                self.assertIn(MACHINERY_RULE, rules)
+                self.assertNotIn(VERSION_RULE, rules)
+                self.put("Back", **{WORKFLOW_PATH: VERSIONED_WORKFLOW})
+
+    def test_a_bump_next_to_another_change_keeps_the_machinery_finding_and_reports_only_the_other_line(self):
+        code, found = self.workflow_change(("ubuntu-24.04", "ubuntu-26.04"), ("timeout-minutes: 10", "timeout-minutes: 0"))
+        self.assertEqual(code, 1)
+        self.assertEqual({(path, line, rule) for path, line, rule, _, _ in found}, {(WORKFLOW_PATH, 5, MACHINERY_RULE), (WORKFLOW_PATH, 7, LOOSEN_RULE)})
+
+    def test_a_bump_next_to_a_removed_line_in_the_same_hunk_is_not_reported_by_line(self):
+        code, found = self.workflow_change(("ubuntu-24.04", "ubuntu-26.04"), ("    timeout-minutes: 10\n", ""))
+        self.assertEqual(code, 1)
+        self.assertEqual({(line, rule) for _, line, rule, _, _ in found}, {(5, MACHINERY_RULE), (7, LOOSEN_RULE)})
+
+    def test_a_reason_line_still_clears_the_blocking_finding_next_to_a_bump(self):
+        self.put(
+            f"Bump and loosen\n\n{REASON}",
+            **{WORKFLOW_PATH: self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04"), ("timeout-minutes: 10", "timeout-minutes: 0"))},
+        )
+        code, found = self.findings()
+        self.assertEqual((code, {j for *_, j in found}), (0, {True}))
+
+    def test_a_bump_that_also_changes_the_permission_bits_or_the_path_is_not_a_bump(self):
+        self.repo.write(WORKFLOW_PATH, self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04")))
+        self.repo.git("add", "-A")
+        self.repo.git("update-index", "--chmod=+x", WORKFLOW_PATH)
+        self.repo.git("commit", "-q", "-m", "Bump and chmod")
+        code, found = self.findings()
+        self.assertEqual((code, {r for _, _, r, _, _ in found}), (1, {MACHINERY_RULE, LOOSEN_RULE}))
+        self.repo.git("mv", WORKFLOW_PATH, ".github/workflows/ci2.yml")
+        self.repo.write(".github/workflows/ci2.yml", self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-22.04")))
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", "Rename and bump")
+        code, found = self.findings()
+        self.assertEqual(code, 1, found)
+        self.assertIn(MACHINERY_RULE, {r for _, _, r, _, _ in found})
+
+    def test_a_version_line_outside_the_hook_and_ci_files_is_not_reported_at_all(self):
+        self.put("Doc", **{"docs/example.yml": "runs-on: ubuntu-24.04\n"})
+        self.put("Doc bump", **{"docs/example.yml": "runs-on: ubuntu-26.04\n"})
+        self.assertEqual(self.findings(), (0, []))
+
+    def test_staged_changes_are_judged_the_same_way(self):
+        self.repo.write(WORKFLOW_PATH, self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04")))
+        self.repo.git("add", "-A")
+        code, found = self.findings("--staged")
+        self.assertEqual((code, [(r, s) for _, _, r, s, _ in found]), (0, [(VERSION_RULE, "note")]))
+
+    def overlay_commit(self, rules):
+        self.put("Overlay", **{".check-integrity.json": json.dumps({"rules": rules})})
+
+    def test_the_overlay_can_make_the_note_blocking(self):
+        self.overlay_commit({VERSION_RULE: {"severity": "block"}})
+        code, found = self.workflow_change(("ubuntu-24.04", "ubuntu-26.04"))
+        self.assertEqual((code, [(r, s, j) for _, _, r, s, j in found]), (1, [(VERSION_RULE, "block", False)]))
+        self.repo.git("commit", "-q", "--amend", "-m", f"Bump\n\n{REASON}")
+        code, found = self.findings()
+        self.assertEqual((code, [(r, s, j) for _, _, r, s, j in found]), (0, [(VERSION_RULE, "block", True)]))
+
+    def test_the_overlay_can_set_nothing_but_the_severity_of_the_note(self):
+        for change in ({"allow": ["x"]}, {"exempt_paths": ["*"]}, {"severity": "loud"}):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ci.OverlayError, VERSION_RULE):
+                    ci.parse_overlay(json.dumps({"rules": {VERSION_RULE: change}}), "overlay", ci.load_rules(RULES))
+
+    def test_a_broken_overlay_in_the_baseline_makes_the_note_block_too(self):
+        self.overlay_commit({"no-such-rule": {"severity": "note"}})
+        self.put("Bump", **{WORKFLOW_PATH: self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04"))})
+        code, out, err = self.repo.scan("--commit", "HEAD", "--json")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("warning", err)
+        self.assertEqual([(f["rule"], f["severity"]) for f in json.loads(out)["findings"]], [(VERSION_RULE, "block")])
+
+    def custom_rules(self, **changes):
+        document = json.loads(RULES.read_text())
+        for key, value in changes.items():
+            if value is None:
+                document.pop(key, None)
+            else:
+                document[key] = value
+        path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-version-rules.json"
+        path.write_text(json.dumps(document))
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_a_rules_table_without_the_list_blocks_every_bump(self):
+        rules = self.custom_rules(version_lines=None)
+        self.put("Bump", **{WORKFLOW_PATH: self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04"))})
+        code, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(rules), "--json")
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual({f["rule"] for f in json.loads(out)["findings"]}, {MACHINERY_RULE, LOOSEN_RULE})
+
+    def test_a_repository_picks_its_own_version_lines(self):
+        rules = self.custom_rules(version_lines=[r"^\s*runs-on:\s*\S.*$"])
+        runner = self.edited(VERSIONED_WORKFLOW, ("ubuntu-24.04", "ubuntu-26.04"))
+        self.put("Runner", **{WORKFLOW_PATH: runner})
+        code, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(rules), "--json")
+        self.assertEqual((code, [f["rule"] for f in json.loads(out)["findings"]]), (0, [VERSION_RULE]), out + err)
+        self.put("Node", **{WORKFLOW_PATH: self.edited(runner, ("node-version: 20", "node-version: 22"))})
+        code, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(rules), "--json")
+        self.assertEqual(code, 1, out + err)
+
+    def test_the_list_is_checked_when_the_table_is_loaded(self):
+        for value, message in (("runs-on", "version_lines"), (["("], "version_lines"), ([""], "version_lines")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ci.IntegrityError, message):
+                    ci.load_rules(self.custom_rules(version_lines=value))
+
+    def test_the_rules_table_cannot_define_the_scanner_s_own_rule(self):
+        document = json.loads(RULES.read_text())
+        document["rules"].append({"id": VERSION_RULE, "kind": "changed", "classes": ["test"], "why": "w"})
+        path = Path(self._tmp.name) / "own.json"
+        path.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ci.IntegrityError, VERSION_RULE):
+            ci.load_rules(path)
+
+    def test_the_default_table_lists_the_five_kinds_of_version_line(self):
+        lines = {
+            "uses": f"      - uses: actions/checkout@{SHA_OLD} # v7.0.1",
+            "uses with a path": "      - uses: github/codeql-action/analyze@v3",
+            "runs-on": "    runs-on: ubuntu-24.04",
+            "a -version key": "          python-version: ['3.12']",
+            "image": "        image: postgres:15",
+            "container": "    container: python:3.12",
+            "rev": "    rev: v1.2.3",
+        }
+        patterns = ci.load_rules(RULES).version_lines
+        for name, line in lines.items():
+            with self.subTest(name):
+                self.assertTrue(any(p.fullmatch(line) for p in patterns), line)
+        for line in ("    timeout-minutes: 10", "      - run: pytest --cov-fail-under=90", "    version: 1", "      - uses: ./local"):
+            with self.subTest(line=line):
+                self.assertFalse(any(p.fullmatch(line) for p in patterns), line)
+
+
 if __name__ == "__main__":
     unittest.main()

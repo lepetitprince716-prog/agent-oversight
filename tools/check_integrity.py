@@ -27,6 +27,10 @@ The files that run the checks (hooks, CI workflows, this scanner and its rules f
 ``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
 deleted or moved file, other permission bits or another file type is a blocking finding
 (rule ``check-machinery-changed``, one per file) next to the rules that read their lines.
+A change that only moves version numbers on version lines (``version_lines`` of the rules file: a
+tagged or pinned ``uses:``, ``runs-on``, a key ending in ``-version``, ``image``, ``container``, a
+pre-commit ``rev``) of a hook or CI file is a note, ``version-bumped``, in place of those two rules
+(see ``bumped``); any other number, and any other change on those lines, stays as it was.
 
 Every git call pins the configuration, attributes and environment that change diff text
 (``GIT_CONFIG``, ``GIT_ENV_DROP``, ``DIFF_FLAGS``), so the verdict does not depend on the clone
@@ -78,7 +82,7 @@ RULE_KEYS = frozenset(
         "severity",
     }
 )
-DOCUMENT_KEYS = frozenset({"version", "note", "classes", "rules"})
+DOCUMENT_KEYS = frozenset({"version", "note", "classes", "rules", "version_lines"})
 BLOCK, NOTE = "block", "note"
 SEVERITIES = frozenset({BLOCK, NOTE})
 OVERLAY_NAME = ".check-integrity.json"
@@ -90,7 +94,13 @@ OVERLAY_GUARD = "overlay-changed"
 # A change the scanner cannot read is judged by the scanner itself too, and the overlay cannot
 # lower it: a diff that could not be read must never pass for one that has nothing in it.
 UNREADABLE = "unreadable-change"
-BUILTIN_RULES = (OVERLAY_GUARD, UNREADABLE)
+# A change that only moves version numbers on version lines (``version_lines`` of the rules file)
+# of a hook or CI file is reported by the scanner itself, as a note, in place of the two rules
+# that would block it. The overlay can raise it to block and set nothing else on it.
+VERSION_BUMPED = "version-bumped"
+BUMPED_RULES = frozenset({"check-file-weakened", "check-machinery-changed"})
+BUMP_CLASS = "bypass"  # a version bump is recognised only in files of this class
+BUILTIN_RULES = (OVERLAY_GUARD, UNREADABLE, VERSION_BUMPED)
 REMERGE_DIFF_GIT = (2, 36)
 MERGE_TREE_GIT = (2, 38)  # git merge-tree --write-tree
 GITLINK = b"160000"  # the mode of a submodule entry
@@ -108,6 +118,10 @@ TEXT_WIDTH = 80
 WORD = re.compile(r"\w+")
 CONDITION = re.compile(r"^\s*(-\s*)?if\s*:")
 CONJUNCTION = re.compile(r"&&|\band\b")
+# What a version bump may change on a version line: a full hex digest (40 or 64 digits) and a
+# version number (digits and dots, optionally led by v); both are replaced before two lines are compared.
+HEX_DIGEST = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{64}|[0-9A-Fa-f]{40})(?![0-9A-Fa-f])")
+VERSION_NUMBER = re.compile(r"(?<![\w.])v?\d+(?:\.\d+)*(?!\w)")
 MARKER_END = re.compile(r"\s--\s|\*/|(?<=.)#")
 # A test file and the source it tests, by file name: test_x.py or x_test.py is x.py,
 # x_test.go is x.go, x.test.ts or x.spec.ts is x plus any JavaScript or TypeScript suffix.
@@ -181,9 +195,13 @@ class Rule:
 class RuleSet:
     classes: dict[str, tuple[re.Pattern[str], ...]]
     rules: tuple[Rule, ...]
+    version_lines: tuple[re.Pattern[str], ...] = ()
+    bump_severity: str = NOTE
 
     def severity_of(self, rule_id: str) -> str:
         """The severity of a rule id; load_rules makes every entry of one id agree."""
+        if rule_id == VERSION_BUMPED:
+            return self.bump_severity
         return next((rule.severity for rule in self.rules if rule.id == rule_id), BLOCK)
 
     def classes_of(self, path: str) -> frozenset[str]:
@@ -270,7 +288,8 @@ def load_rules(path: Path) -> RuleSet:
     for rule in rules:
         if levels.setdefault(rule.id, rule.severity) != rule.severity:
             raise IntegrityError(f"{path}: entries of rule {rule.id} must share one severity")
-    return RuleSet(classes, rules)
+    version_lines = compile_list(document.get("version_lines", []), f"{path}: version_lines")
+    return RuleSet(classes, rules, version_lines)
 
 
 def parse_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
@@ -310,8 +329,14 @@ def apply_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
     allow: dict[str, tuple[re.Pattern[str], ...]] = {}
     exempt: dict[str, tuple[str, ...]] = {}
     severity: dict[str, str] = {}
+    bump_severity = rules.bump_severity
     for rule_id, change in changes.items():
         here = f"{where}: rule {rule_id}"
+        if rule_id == VERSION_BUMPED:
+            if not isinstance(change, dict) or set(change) - {"severity"} or change.get("severity", BLOCK) not in SEVERITIES:
+                raise OverlayError(f"{here}: the overlay may set only its severity, one of {sorted(SEVERITIES)}")
+            bump_severity = change.get("severity", bump_severity)
+            continue
         if rule_id == OVERLAY_GUARD:
             raise OverlayError(
                 f"{here}: the overlay cannot change this rule; any change to {OVERLAY_NAME} needs a reason line"
@@ -348,6 +373,8 @@ def apply_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
             )
             for rule in rules.rules
         ),
+        rules.version_lines,
+        bump_severity,
     )
 
 
@@ -848,7 +875,12 @@ class Judges:
                 f"{PROG}: warning: {' '.join(str(exc).split())}; no overlay is applied and every rule is judged as {BLOCK}",
                 file=sys.stderr,
             )
-            return RuleSet(self.rules.classes, tuple(replace(rule, severity=BLOCK) for rule in self.rules.rules))
+            return RuleSet(
+                self.rules.classes,
+                tuple(replace(rule, severity=BLOCK) for rule in self.rules.rules),
+                self.rules.version_lines,
+                BLOCK,
+            )
 
 
 # --- judging -------------------------------------------------------------------------
@@ -1044,9 +1076,64 @@ def unreadable_hits(diffs: list[FileDiff]) -> list[Hit]:
     return [Hit(diff.path, 0, UNREADABLE, diff.unreadable) for diff in diffs if diff.unreadable]
 
 
+def normalized(text: str) -> str:
+    """A version line with its digests and version numbers replaced by placeholders."""
+    return VERSION_NUMBER.sub("<version>", HEX_DIGEST.sub("<digest>", text.strip()))
+
+
+def bump_pairs(diff: FileDiff, rules: RuleSet) -> tuple[set[Line], set[Line]]:
+    """The removed and the added lines that pair up as version bumps. A removed line pairs with
+    the next added line of its hunk that is a version line as well and equal to it once its
+    digests and version numbers are replaced, so the repository, the path, the key, the number
+    of items in a list and every other character stay as they were. Each added line pairs
+    once, and in order."""
+    is_version = lambda line: any(p.fullmatch(line.text.rstrip("\r\n")) for p in rules.version_lines)
+    old_side: set[Line] = set()
+    new_side: set[Line] = set()
+    for hunk in sorted({line.hunk for line in diff.removed + diff.added}):
+        added = [line for line in diff.added if line.hunk == hunk]
+        start = 0
+        for gone in (line for line in diff.removed if line.hunk == hunk and is_version(line)):
+            for at in range(start, len(added)):
+                if is_version(added[at]) and normalized(added[at].text) == normalized(gone.text):
+                    old_side.add(gone)
+                    new_side.add(added[at])
+                    start = at + 1
+                    break
+    return old_side, new_side
+
+
+def bumped(diff: FileDiff, hits: list[Hit], rules: RuleSet) -> list[Hit]:
+    """The hits of one file, with a version bump taken out of what the rules BUMPED_RULES say.
+    A file of class BUMP_CLASS that was modified in place (no move, no retype, no new
+    permission bits) and whose every changed line pairs as a bump (``bump_pairs``) reports one
+    ``version-bumped`` hit instead of those rules. When it has other changed lines too, the
+    whole-file rule stays and only the paired lines are no longer reported one by one."""
+    affected = [hit for hit in hits if hit.rule in BUMPED_RULES]
+    if (
+        not affected
+        or not rules.version_lines
+        or diff.status != "M"
+        or diff.unreadable
+        or diff.typechange
+        or diff.mode_change is not None
+        or BUMP_CLASS not in rules.classes_of(diff.path)
+    ):
+        return hits
+    old_side, new_side = bump_pairs(diff, rules)
+    if not old_side:
+        return hits
+    if len(old_side) == len(diff.removed) and len(new_side) == len(diff.added):
+        first = min(diff.added + diff.removed, key=lambda line: line.number)
+        return [hit for hit in hits if hit.rule not in BUMPED_RULES] + [Hit(diff.path, first.number, VERSION_BUMPED, first.text)]
+    whole_file = {rule.id for rule in rules.rules if rule.kind == "changed"}
+    paired = {(line.number, line.text) for line in old_side | new_side}
+    return [hit for hit in hits if hit.rule in whole_file or (hit.line, hit.text) not in paired or hit.rule not in BUMPED_RULES]
+
+
 def judge_change(diffs: list[FileDiff], rules: RuleSet) -> list[Hit]:
     """Every rule that fires on one change, in diff order; a rule fires once per line."""
-    hits = [hit for diff in diffs for hit in judge_file(diff, diffs, rules)]
+    hits = [hit for diff in diffs for hit in bumped(diff, judge_file(diff, diffs, rules), rules)]
     hits += overlay_hits(diffs) + unreadable_hits(diffs)
     for rule in rules.rules:
         if rule.kind == "net-loss":
