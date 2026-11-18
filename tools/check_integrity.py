@@ -11,6 +11,10 @@ never fails the run. A repository can adjust severities, add ``allow`` patterns 
 paths in its own ``.check-integrity.json`` (see ``load_overlay``); any change to that file is
 itself a blocking finding (rule ``overlay-changed``). A merge commit is judged by what the
 merge changed beyond the automatic merge (``git show --remerge-diff``, git 2.36 or newer).
+The files that run the checks (hooks, CI workflows, this scanner and its rules file; class
+``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
+deleted or moved file, other permission bits or another file type is a blocking finding
+(rule ``check-machinery-changed``, one per file) next to the rules that read their lines.
 
 Every git call pins the configuration, attributes and environment that change diff text
 (``GIT_CONFIG``, ``GIT_ENV_DROP``, ``DIFF_FLAGS``), so the verdict does not depend on the clone
@@ -45,7 +49,8 @@ from typing import NamedTuple
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 PROG = "check-integrity"
 DEFAULT_RULES = Path(__file__).resolve().with_name("check_integrity_rules.json")
-KINDS = frozenset({"added", "net-added", "removed", "net-loss", "deleted"})
+KINDS = frozenset({"added", "net-added", "removed", "net-loss", "deleted", "changed"})
+LINELESS_KINDS = frozenset({"deleted", "changed"})  # judged by the file, not by its lines
 RULE_KEYS = frozenset(
     {
         "id",
@@ -196,8 +201,10 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
     patterns = compile_list(raw.get("patterns", []), f"{where} patterns")
     if raw["id"] in BUILTIN_RULES:
         raise IntegrityError(f"{where}: {raw['id']} is the scanner's own rule and cannot be defined here")
-    if raw["kind"] != "deleted" and not patterns:
+    if raw["kind"] not in LINELESS_KINDS and not patterns:
         raise IntegrityError(f"{where}: kind {raw['kind']} needs patterns")
+    if raw["kind"] == "changed" and patterns:
+        raise IntegrityError(f"{where}: kind changed fires on the file, not on its lines, and takes no patterns")
     flags = {key: raw.get(key, False) for key in ("existing_only", "spare_with_source")}
     if not all(isinstance(value, bool) for value in flags.values()):
         raise IntegrityError(f"{where}: existing_only and spare_with_source must be true or false")
@@ -329,7 +336,8 @@ class Line(NamedTuple):
 class FileDiff:
     """One changed file. ``status`` is A (added, or copied), M, D or R (renamed from
     ``old_path``); a rename's lines are only the changes made on top of the move. A file that
-    changed type has status D and ``typechange``: only its old side is judged. ``unreadable``
+    changed type has status D and ``typechange``: only its old side is judged. ``mode_change``
+    is the old and new file mode of a file whose permission bits changed. ``unreadable``
     says why the scanner could not read the change; such a file has no lines."""
 
     path: str
@@ -337,6 +345,7 @@ class FileDiff:
     old_path: str | None = None
     binary: bool = False
     typechange: bool = False
+    mode_change: tuple[str, str] | None = None
     unreadable: str | None = None
     added: list[Line] = field(default_factory=list)
     removed: list[Line] = field(default_factory=list)
@@ -550,6 +559,8 @@ def read_change(command: list[str], base: list[str], change: Change, merge: bool
         return FileDiff(path, status, old_path, unreadable=str(exc))
     if merge:
         diff.removed = [line for line in diff.removed if not CONFLICT_MARKER.match(line.text)]
+    if change.old_mode != change.new_mode and status in ("M", "R"):
+        diff.mode_change = (change.old_mode.decode("ascii", "replace"), change.new_mode.decode("ascii", "replace"))
     return diff
 
 
@@ -776,6 +787,12 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
     for rule in rules.rules:
         if rule.exempts(diff):
             continue
+        if rule.kind == "changed":
+            before = rules.classes_of(diff.old_path) if diff.old_path is not None else frozenset()
+            hit = changed_hit(diff, rule)
+            if hit and (classes | before).intersection(rule.classes) and not (rule.existing_only and diff.status == "A"):
+                hits.append(hit)
+            continue
         if rule.kind == "deleted":
             if gone(diff, rule, rules) and not (rule.spare_with_source and spared(diff, diffs)):
                 hits.append(Hit(diff.path, 0, rule.id, "(file type changed)" if diff.typechange else "(file deleted)"))
@@ -791,6 +808,24 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
         else:  # removed
             hits += removed_hits(diff, rule)
     return hits
+
+
+def changed_hit(diff: FileDiff, rule: Rule) -> Hit | None:
+    """The one hit of a ``changed`` rule on a file: what happened to the file, or its first
+    changed line. The line is 0 when the file as such was added, deleted, moved, retyped or
+    given other permission bits. A file left with nothing changed (a merge resolution that
+    only removed conflict markers) has none."""
+    if diff.typechange:
+        return Hit(diff.path, 0, rule.id, "(file type changed)")
+    if diff.status != "M":
+        what = {"A": "added", "D": "deleted", "R": f"moved from {diff.old_path}"}.get(diff.status, f"status {diff.status}")
+        return Hit(diff.path, 0, rule.id, f"(file {what})")
+    lines = sorted(diff.added + diff.removed, key=lambda line: line.number)
+    if lines:
+        return Hit(diff.path, lines[0].number, rule.id, lines[0].text)
+    if diff.mode_change is None:
+        return None
+    return Hit(diff.path, 0, rule.id, "(file mode {} -> {})".format(*diff.mode_change))
 
 
 def overlay_hits(diffs: list[FileDiff]) -> list[Hit]:

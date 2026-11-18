@@ -342,20 +342,27 @@ class CheckFileWeakened(RepoCase):
         self.repo.commit(_github__workflows__ci_yml=WORKFLOW)
         self.repo.commit(_github__workflows__ci_yml=None)
         self.assertEqual(
-            self.rules_at_head(), {(".github/workflows/ci.yml", 0, "check-file-weakened", False)}
+            self.rules_at_head(),
+            {
+                (".github/workflows/ci.yml", 0, "check-file-weakened", False),
+                (".github/workflows/ci.yml", 0, "check-machinery-changed", False),
+            },
         )
 
     def test_removed_step_is_red_comment_and_addition_are_green(self):
         self.repo.commit(_github__workflows__ci_yml=WORKFLOW)
         self.repo.commit(_github__workflows__ci_yml=WORKFLOW.replace("      - run: make lint\n", ""))
         self.assertEqual(
-            self.rules_at_head(), {(".github/workflows/ci.yml", 5, "check-file-weakened", False)}
+            self.rules_at_head(),
+            {
+                (".github/workflows/ci.yml", 5, "check-file-weakened", False),
+                (".github/workflows/ci.yml", 5, "check-machinery-changed", False),
+            },
         )
         self.repo.commit(
             _github__workflows__ci_yml=WORKFLOW.replace("# CI\n", "") + "      - run: make docs\n"
         )
-        code, out, _ = self.repo.scan("--commit", "HEAD")
-        self.assertEqual(code, 0, out)
+        self.assertEqual(self.rule_names(), {"check-machinery-changed"})
 
     def test_lint_configs_and_own_files_are_check_files(self):
         files = {
@@ -616,7 +623,7 @@ class MergeCommits(RepoCase):
         self.repo.git("checkout", "-q", "main")
         self.repo.commit("Main", **{".github__workflows__ci_yml": "steps:\n  - run: make test-b\n"})
         self.merge(**{".github__workflows__ci_yml": "steps:\n  - run: make test-a\n"})
-        self.assertEqual(self.rule_names(), {"check-file-weakened"})
+        self.assertEqual(self.rule_names(), {"check-file-weakened", "check-machinery-changed"})
 
     def test_an_octopus_merge_is_an_unreadable_change_not_a_pass_and_not_a_crash(self):
         for name in ("one", "two"):
@@ -844,8 +851,10 @@ class NarrowedRules(RepoCase):
             _github__workflows__ci_yml="jobs:\n  gate:\n    needs: [lint, test, chat]\n",
             pyproject_toml='[tool.ruff.lint]\nselect = ["E9", "F", "B"]\n',
         )
-        code, out, _ = self.repo.scan("--commit", "HEAD")
-        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            {(path, rule) for path, _, rule, _ in self.rules_at_head()},
+            {(".github/workflows/ci.yml", "check-machinery-changed")},
+        )
 
     def test_narrowed_check_lines_are_red(self):
         self.repo.commit(
@@ -861,7 +870,11 @@ class NarrowedRules(RepoCase):
         found = {(path, line, rule) for path, line, rule, _ in self.rules_at_head()}
         self.assertEqual(
             found,
-            {("pyproject.toml", 2, "check-file-weakened"), (".github/workflows/ci.yml", 3, "check-file-weakened")},
+            {
+                ("pyproject.toml", 2, "check-file-weakened"),
+                (".github/workflows/ci.yml", 3, "check-file-weakened"),
+                (".github/workflows/ci.yml", 3, "check-machinery-changed"),
+            },
         )
 
     # check-file-weakened: a loosening line in a mixed config counts only if the file existed
@@ -904,7 +917,11 @@ class NarrowedRules(RepoCase):
         for path, line in samples.items():
             self.repo.write(path, line)
         self.repo.commit()
-        self.assertEqual(self.findings(), {(path, "bypass-added") for path in samples})
+        machinery = {".githooks/pre-commit", ".pre-commit-config.yaml"}
+        self.assertEqual(
+            self.findings(),
+            {(path, "bypass-added") for path in samples} | {(path, "check-machinery-changed") for path in machinery},
+        )
 
     # test-removed and assertion-loss: counted over all test files of the commit
 
@@ -1557,7 +1574,7 @@ class RepositoryHooks(unittest.TestCase):
         self.repo.write("tests/test_thing.py", BASE_TEST)
         self.repo.write("src/a.py", "x = 1\n")
         self.repo.git("add", "-A")
-        self.commit("Seed the repository")
+        self.commit(f"Seed the repository\n\n{REASON}")
 
     def commit(self, message, *extra):
         done = subprocess.run(
@@ -1910,6 +1927,228 @@ class UnreadableChanges(RepoCase):
                 self.assertEqual(code, 2, out)
                 self.assertIn("unreadable-change", err)
                 self.assertIn("cannot", err)
+
+
+MACHINERY = {
+    ".githooks/pre-push": "#!/bin/sh\nset -eu\npython3 tools/check_integrity.py --pre-push\n",
+    ".githooks/commit-msg": "#!/bin/sh\nset -eu\npython3 tools/check_integrity.py --staged\n",
+    ".husky/pre-commit": "npm test\n",
+    ".pre-commit-config.yaml": "repos: []\n",
+    ".github/workflows/ci.yml": WORKFLOW,
+    ".gitlab-ci.yml": "test:\n  script: make test\n",
+    "tools/check_integrity.py": "def judge_change(diffs, rules):\n    return []\n",
+    "tools/check_integrity_rules.json": '{"version": 1}\n',
+}
+MACHINERY_RULE = "check-machinery-changed"
+LOOSEN_RULE = "check-file-weakened"
+
+
+class MachineryChanged(RepoCase):
+    """The files that run the checks are judged as a whole: any change to one of them is a
+    finding, whatever its lines look like."""
+
+    def setUp(self):
+        super().setUp()
+        self.put("Seed", **MACHINERY)
+
+    def put(self, message, **files):
+        """Write files (path -> text, or None to delete) and commit them under that message."""
+        for path, content in files.items():
+            if content is None:
+                self.repo.git("rm", "-q", "--", path)
+            else:
+                self.repo.write(path, content)
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", message)
+
+    def machinery_hits(self, *scan_args):
+        code, out, err = self.repo.scan(*(scan_args or ("--commit", "HEAD")), "--json")
+        self.assertIn(code, (0, 1), out + err)
+        return code, [f for f in json.loads(out)["findings"] if f["rule"] == MACHINERY_RULE]
+
+    def test_a_line_added_to_a_check_file_is_a_finding_in_every_machinery_file(self):
+        for path, content in MACHINERY.items():
+            with self.subTest(path=path):
+                self.put("Add a line", **{path: content + "extra\n"})
+                code, found = self.machinery_hits()
+                self.assertEqual((code, [(f["path"], f["justified"]) for f in found]), (1, [(path, False)]))
+                self.assertEqual(found[0]["severity"], "block")
+
+    def test_the_ways_to_switch_a_hook_and_a_ci_step_off_are_all_findings(self):
+        hook, workflow, scanner = ".githooks/commit-msg", ".github/workflows/ci.yml", "tools/check_integrity.py"
+        edits = {
+            "exit 0 inserted": {hook: MACHINERY[hook].replace("set -eu\n", "set -eu\nexit 0\n")},
+            "a colon in front": {hook: MACHINERY[hook].replace("python3", ": python3")},
+            "an if on the step": {
+                workflow: WORKFLOW.replace("      - run: make test\n", "      - if: github.event_name == 'x'\n        run: make test\n")
+            },
+            "echo in front": {workflow: WORKFLOW.replace("make test", "echo make test")},
+            "the scanner returns early": {scanner: MACHINERY[scanner].replace("    return []\n", "    return []\n    return 1\n")},
+        }
+        for name, change in edits.items():
+            with self.subTest(name):
+                self.put("Edit", **change)
+                code, found = self.machinery_hits()
+                self.assertEqual((code, [f["path"] for f in found]), (1, list(change)))
+                self.put("Back", **{path: MACHINERY[path] for path in change})
+
+    def test_a_removed_line_is_a_finding_next_to_the_rule_that_reports_it_by_line(self):
+        self.put("Drop a step", **{".github/workflows/ci.yml": WORKFLOW.replace("      - run: make lint\n", "")})
+        self.assertEqual(
+            {(path, rule) for path, _, rule, _ in self.rules_at_head()},
+            {(".github/workflows/ci.yml", LOOSEN_RULE), (".github/workflows/ci.yml", MACHINERY_RULE)},
+        )
+
+    def test_a_change_of_the_permission_bits_is_a_finding(self):
+        for path in (".githooks/pre-push", ".githooks/commit-msg"):
+            for mode, sign in (("100755", "+"), ("100644", "-")):
+                with self.subTest(path=path, mode=mode):
+                    self.repo.git("update-index", f"--chmod={sign}x", path)
+                    self.repo.git("commit", "-q", "-m", "Change the mode")
+                    code, found = self.machinery_hits()
+                    self.assertEqual((code, [f["path"] for f in found]), (1, [path]))
+                    self.assertIn(mode, found[0]["text"])
+
+    def test_a_new_deleted_moved_or_retyped_check_file_is_a_finding(self):
+        self.put("New", **{".githooks/post-commit": "#!/bin/sh\n"})
+        self.assertEqual([f["path"] for f in self.machinery_hits()[1]], [".githooks/post-commit"])
+        self.put("Deleted", **{".githooks/post-commit": None})
+        self.assertEqual([f["path"] for f in self.machinery_hits()[1]], [".githooks/post-commit"])
+        self.repo.git("mv", ".githooks/pre-push", ".githooks/pre-push.off")
+        self.repo.git("commit", "-q", "-m", "Moved")
+        self.assertEqual([f["path"] for f in self.machinery_hits()[1]], [".githooks/pre-push.off"])
+        (self.repo.root / ".githooks/commit-msg").unlink()
+        os.symlink("pre-push.off", self.repo.root / ".githooks/commit-msg")
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", "Linked")
+        self.assertEqual([f["path"] for f in self.machinery_hits()[1]], [".githooks/commit-msg"])
+
+    def test_a_file_moved_into_the_machinery_or_out_of_it_is_a_finding(self):
+        self.put("A tool", **{"tools/runner.py": "print('x')\n"})
+        self.repo.git("mv", "tools/runner.py", ".githooks/runner.py")
+        self.repo.git("commit", "-q", "-m", "Into the hooks")
+        self.assertEqual([f["path"] for f in self.machinery_hits()[1]], [".githooks/runner.py"])
+        self.repo.git("mv", ".githooks/runner.py", "tools/runner.py")
+        self.repo.git("commit", "-q", "-m", "Out of the hooks")
+        self.assertEqual([f["path"] for f in self.machinery_hits()[1]], ["tools/runner.py"])
+
+    def test_it_reports_each_file_once_however_many_lines_changed(self):
+        self.put("Many", **{".githooks/pre-push": MACHINERY[".githooks/pre-push"] + "a\nb\nc\n", ".husky/pre-commit": "npm run lint\n"})
+        _, found = self.machinery_hits()
+        self.assertEqual(sorted(f["path"] for f in found), [".githooks/pre-push", ".husky/pre-commit"])
+
+    def test_a_reason_line_makes_the_finding_pass(self):
+        self.put(f"Tidy\n\n{REASON}", **{".githooks/pre-push": MACHINERY[".githooks/pre-push"] + "exit 0\n"})
+        code, found = self.machinery_hits()
+        self.assertEqual((code, [f["justified"] for f in found]), (0, [True]))
+
+    def test_other_files_and_lint_configs_are_not_machinery(self):
+        self.put("Configs", **{"ruff.toml": "line-length = 100\n", "pytest.ini": "[pytest]\n"})
+        self.put("More", **{"ruff.toml": "line-length = 90\n", "pytest.ini": "[pytest]\naddopts = -q\n", "src/a.py": "x = 1\n", "docs/guide.md": "# g\n"})
+        self.assertEqual(self.machinery_hits()[1], [])
+
+    def test_the_overlay_can_lower_or_exempt_the_rule(self):
+        hook = ".githooks/pre-push"
+        cases = (
+            ({"severity": "note"}, (0, ["note"])),
+            ({"exempt_paths": [".githooks/*"]}, (0, [])),
+            ({"allow": ["x"]}, (1, ["block"])),
+        )
+        for change, expected in cases:
+            with self.subTest(change=change):
+                self.put("Overlay", **{".check-integrity.json": json.dumps({"rules": {MACHINERY_RULE: change}})})
+                self.put("Hook", **{hook: MACHINERY[hook] + "exit 0\n"})
+                code, found = self.machinery_hits()
+                self.assertEqual((code, [f["severity"] for f in found]), expected)
+                self.put("Back", **{hook: MACHINERY[hook], ".check-integrity.json": None})
+
+    def custom_rules(self, machinery):
+        document = json.loads(RULES.read_text())
+        document["classes"]["machinery"] = machinery
+        path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-rules.json"
+        path.write_text(json.dumps(document))
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_a_repository_defines_its_machinery_by_the_class_in_its_own_rules_table(self):
+        rules = self.custom_rules(["^Makefile$"])
+        self.put("Both", **{"Makefile": "all:\n\ttrue\n", ".githooks/pre-push": MACHINERY[".githooks/pre-push"] + "# x\n"})
+        code, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(rules), "--json")
+        found = [f["path"] for f in json.loads(out)["findings"] if f["rule"] == MACHINERY_RULE]
+        self.assertEqual(found, ["Makefile"], out + err)
+
+    def test_existing_only_on_a_changed_rule_spares_the_files_the_change_adds(self):
+        document = json.loads(RULES.read_text())
+        next(r for r in document["rules"] if r["id"] == MACHINERY_RULE)["existing_only"] = True
+        rules = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-existing.json"
+        rules.write_text(json.dumps(document))
+        self.addCleanup(lambda: rules.unlink(missing_ok=True))
+        self.put("Both", **{".githooks/post-commit": "#!/bin/sh\n", ".husky/pre-commit": "npm run lint\n"})
+        _, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(rules), "--json")
+        found = [f["path"] for f in json.loads(out)["findings"] if f["rule"] == MACHINERY_RULE]
+        self.assertEqual(found, [".husky/pre-commit"], out + err)
+
+    def test_a_rule_of_the_changed_kind_takes_no_patterns(self):
+        document = json.loads(RULES.read_text())
+        rule = next(r for r in document["rules"] if r["id"] == MACHINERY_RULE)
+        rule["patterns"] = ["x"]
+        bad = Path(self._tmp.name) / "bad.json"
+        bad.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ci.IntegrityError, "changed"):
+            ci.load_rules(bad)
+
+    def test_the_default_table_ties_the_machinery_to_the_hook_and_ci_classes_and_the_scanner(self):
+        rules = ci.load_rules(RULES)
+        patterns = lambda name: {p.pattern for p in rules.classes[name]}
+        scanner = {r"(^|/)tools/check_integrity\.py$", r"(^|/)tools/check_integrity_rules\.json$"}
+        self.assertEqual(patterns("machinery"), patterns("bypass") | scanner)
+        rule = next(r for r in rules.rules if r.id == MACHINERY_RULE)
+        self.assertEqual((rule.kind, rule.severity, rule.classes), ("changed", "block", ("machinery",)))
+
+
+class LintConfigLoosened(RepoCase):
+    """The lint and test configuration files get the loosening check that pyproject.toml has."""
+
+    FILES = {
+        "ruff.toml": ("line-length = 100\n", 'ignore = ["E", "F"]\n'),
+        ".ruff.toml": ("line-length = 100\n", 'extend-ignore = ["E"]\n'),
+        "pytest.ini": ("[pytest]\ntestpaths = tests\n", "addopts = --ignore=tests\n"),
+        "setup.cfg": ("[metadata]\nname = demo\n", "[flake8]\nignore = E501\n"),
+        "tox.ini": ("[tox]\nenvlist = py\n", "[pytest]\naddopts = --deselect tests/a.py\n"),
+        ".flake8": ("[flake8]\nmax-line-length = 100\n", "extend-ignore = E203\n"),
+        "mypy.ini": ("[mypy]\nwarn_unused_ignores = True\n", "ignore_errors = True\n"),
+        ".pylintrc": ("[MASTER]\njobs = 1\n", "ignore = tests\n"),
+        ".coveragerc": ("[run]\nbranch = True\n", "fail_under = 0\n"),
+        "deny.toml": ("[advisories]\n", 'ignore = ["RUSTSEC-0000-0000"]\n'),
+        ".golangci.yml": ("run:\n  timeout: 5m\n", "  exclude: [vendor]\n"),
+        "biome.json": ('{\n  "linter": {}\n}\n', '{\n  "linter": {},\n  "ignore": ["src"]\n}\n'),
+        ".eslintrc.json": ('{\n  "rules": {}\n}\n', '{\n  "rules": {},\n  "ignorePatterns": ["src"]\n}\n'),
+    }
+
+    def put(self, message, path, text):
+        self.repo.write(path, text)
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", message)
+
+    def test_a_loosening_line_added_to_an_existing_config_is_a_finding(self):
+        for name, (base, loosened) in self.FILES.items():
+            with self.subTest(name):
+                self.put(f"Add {name}", name, base)
+                self.put(f"Loosen {name}", name, loosened if loosened.startswith("{") else base + loosened)
+                found = {(path, rule) for path, _, rule, _ in self.rules_at_head()}
+                self.assertIn((name, LOOSEN_RULE), found)
+
+    def test_a_new_config_file_is_not_a_loosening(self):
+        self.repo.commit(ruff_toml='ignore = ["E"]\n')
+        self.assertEqual(self.rules_at_head(), set())
+
+    def test_the_default_table_applies_the_loosening_rule_to_the_lint_class_too(self):
+        rules = ci.load_rules(RULES)
+        loosen = next(r for r in rules.rules if r.id == LOOSEN_RULE and r.kind == "added")
+        self.assertEqual(set(loosen.classes), {"mixed", "lint-config"})
+        for path in ("ruff.toml", "pytest.ini", "setup.cfg", "tox.ini", ".flake8", "mypy.ini"):
+            self.assertIn("lint-config", rules.classes_of(path), path)
+        self.assertNotIn("lint-config", rules.classes_of("pyproject.toml"))
 
 
 if __name__ == "__main__":

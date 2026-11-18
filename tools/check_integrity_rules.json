@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'net-added' likewise, but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change. severity: 'block' (the default) needs a Check-change line in the commit message; 'note' is printed and counted but never fails the run. An id may appear in several entries; they share one severity. A repository adjusts severity and appends allow-regexes per rule id in its own .check-integrity.json.",
+  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'net-added' likewise, but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class; 'changed' fires once on a file of the class (before or after a move) that the change adds, deletes, moves, retypes, gives other permission bits or alters by any line, whatever the line says, and takes no patterns. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' and 'changed' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change. severity: 'block' (the default) needs a Check-change line in the commit message; 'note' is printed and counted but never fails the run. An id may appear in several entries; they share one severity. A repository adjusts severity, appends allow-regexes (they have no effect on a rule without patterns) and exempts paths per rule id in its own .check-integrity.json. Class machinery is what check-machinery-changed guards: the hook and CI paths of class bypass and the scanner's own two files; a repository changes the rule's scope by changing this class. Class lint-config is the lint and test configuration, which the added-line loosening rule of class mixed also covers.",
   "classes": {
     "test": [
       "(^|/)tests?/",
@@ -65,6 +65,38 @@
       "(^|/)\\.check-integrity\\.json$",
       "(^|/)tools/privacy_scan\\.py$",
       "(^|/)tools/privacy_rules\\.json$"
+    ],
+    "machinery": [
+      "(^|/)\\.githooks/",
+      "(^|/)\\.husky/",
+      "(^|/)\\.pre-commit-config\\.ya?ml$",
+      "(^|/)\\.?lefthook(-local)?\\.ya?ml$",
+      "(^|/)\\.github/workflows/",
+      "(^|/)\\.gitlab-ci\\.ya?ml$",
+      "(^|/)\\.circleci/",
+      "(^|/)azure-pipelines\\.ya?ml$",
+      "(^|/)tools/check_integrity\\.py$",
+      "(^|/)tools/check_integrity_rules\\.json$"
+    ],
+    "lint-config": [
+      "(^|/)\\.?ruff\\.toml$",
+      "(^|/)\\.?mypy\\.ini$",
+      "(^|/)\\.flake8$",
+      "(^|/)\\.?pylintrc$",
+      "(^|/)pyrightconfig\\.json$",
+      "(^|/)pytest\\.ini$",
+      "(^|/)setup\\.cfg$",
+      "(^|/)tox\\.ini$",
+      "(^|/)\\.coveragerc$",
+      "(^|/)\\.eslintrc([.][A-Za-z]+)?$",
+      "(^|/)eslint\\.config\\.[cm]?[jt]s$",
+      "(^|/)biome\\.jsonc?$",
+      "(^|/)\\.?clippy\\.toml$",
+      "(^|/)deny\\.toml$",
+      "(^|/)\\.golangci\\.(ya?ml|toml|json)$",
+      "(^|/)\\.shellcheckrc$",
+      "(^|/)\\.stylelintrc([.][A-Za-z]+)?$",
+      "(^|/)\\.markdownlint(-cli2)?\\.(jsonc?|ya?ml)$"
     ],
     "mixed": [
       "(^|/)pyproject\\.toml$",
@@ -207,6 +239,14 @@
       ]
     },
     {
+      "id": "check-machinery-changed",
+      "kind": "changed",
+      "classes": [
+        "machinery"
+      ],
+      "why": "a hook, a CI workflow or the scanner itself was changed: added, deleted, moved, given other permission bits or altered by any line"
+    },
+    {
       "id": "check-file-weakened",
       "kind": "deleted",
       "classes": [
@@ -263,7 +303,8 @@
       "id": "check-file-weakened",
       "kind": "added",
       "classes": [
-        "mixed"
+        "mixed",
+        "lint-config"
       ],
       "why": "a line that loosens a check was added to an existing config file",
       "patterns": [
