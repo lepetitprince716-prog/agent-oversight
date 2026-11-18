@@ -77,7 +77,7 @@ linter 或类型检查、绕过钩子或 CI 步骤、从检查配置里删行。
 
 ```bash
 python3 tools/check_integrity.py --staged --message-file .git/COMMIT_EDITMSG   # commit-msg 钩子跑的
-python3 tools/check_integrity.py --commit HEAD                                 # 一个提交
+python3 tools/check_integrity.py --commit HEAD                                 # 一个提交（合并提交见下）
 python3 tools/check_integrity.py --range origin/main..HEAD                     # 一个范围里的每个提交
 python3 tools/check_integrity.py --pre-push < refs                             # git 给 pre-push 钩子的那几行
 ```
@@ -85,10 +85,17 @@ python3 tools/check_integrity.py --pre-push < refs                             #
 退出码 0 表示没有需要理由的发现，或都有理由；1 表示有没理由的 `block` 发现；2 表示工具没能完成检查（规则表读
 不了、git 调用失败、diff 解析不了），不会默认放行。`--json` 给程序看，每条发现带级别。
 
+合并提交按这次合并在自动合并之外又改了什么来判（`git show --remerge-diff`）：干净的合并没有发现，被合并进来的提交
+各自只判一次。解决冲突时加了跳过、删了检查行，会报在合并提交上；解决冲突时去掉的冲突标记不算。这要 git 2.36 或更新：
+git 太旧，或者是章鱼合并（三个及以上父提交，git 不能对它做 remerge-diff），退出码为 2 并说明，不会换个办法硬判。
+`--staged` 在收尾一次合并的提交上，仍然和第一个父提交比。
+
 ### 单个仓库调整规则
 
-仓库顶层的 `.check-integrity.json` 叠加在规则表上。它只能按规则 id 设 `severity` 和追加 `allow` 正则，别的
+仓库顶层的 `.check-integrity.json` 叠加在规则表上。它只能按规则 id 改 `severity`、追加 `allow` 正则和列 `exempt_paths`，别的
 键或规则表里没有的 id 都是错误（退出码 2）。`allow` 正则从每处匹配的起点试起，对规则覆盖的所有文件生效。
+`exempt_paths` 是对仓库内相对路径的 glob（`fnmatch` 规则：`*` 也匹配 `/`），路径匹配的文件完全不受这条规则判断；
+重命名的文件要新旧两个路径都匹配才算豁免。
 
 ```json
 {
@@ -100,11 +107,12 @@ python3 tools/check_integrity.py --pre-push < refs                             #
 }
 ```
 
-这个文件本身算检查文件：从里面删行，和其他削弱检查的改动一样要 `Check-change:` 行。`--overlay PATH` 读另一个文件，
-`--no-overlay` 不读。
+这个文件本身受管：对它的任何改动（加行、删行、新建、删除）都是扫描器自己的 `overlay-changed` 规则的一条 `block`
+发现，要 `Check-change:` 行，所以一次提交不能不说理由就放宽判它的规则。叠加文件不能改动、降级或豁免这条规则（退出码
+2）。`--overlay PATH` 读另一个文件，`--no-overlay` 不读。
 
-本仓库自己的文件放行扫描器测试里当作数据的标记字符串：`skip-added` 命中的那一行同时含字面的 `\n`，或者紧跟在扫描器
-自己的输出文字后面。改这些字符串不要理由行；删测试或删断言照样要。
+本仓库自己的文件让 `tests/test_check_integrity.py` 不受 `skip-added`、`suppression-added`、`bypass-added` 判断：
+这个文件里有当作数据的标记字符串。改这些字符串不要理由行；在这个文件里删测试或删断言照样要，在别的测试文件里加跳过也照样要。
 
 ### 在别的仓库里用
 
@@ -119,8 +127,9 @@ python3 tools/check_integrity.py --staged --message-file "$1"
 ```
 
 pre-push 钩子把 git 给的标准输入接到 `--pre-push`；新分支扫的是没有任何远端分支持有的提交。
-[.github/workflows/ci.yml](.github/workflows/ci.yml) 对每次推送和拉取请求跑同样的扫描，拉取请求上扫描器、
-规则表和 `.check-integrity.json` 取自 base 分支。
+[.github/workflows/ci.yml](.github/workflows/ci.yml) 对每个拉取请求、以及每次推送到默认分支以外的分支，跑同样的扫描，
+拉取请求上扫描器、规则表和 `.check-integrity.json` 取自 base 分支。推送到默认分支时不扫：合并拉取请求产生的提交
+不带原来各个提交的 `Check-change:` 行，而拉取请求已经逐个提交判过。本地的 pre-push 钩子仍然会扫直接推送。
 
 ## 模板
 

@@ -2,7 +2,13 @@
   "version": 1,
   "rules": {
     "skip-added": {
-      "allow": [".*\\\\n", "(?<=skip-added  )", "(?<=skip-added justified  )"]
+      "exempt_paths": ["tests/test_check_integrity.py"]
+    },
+    "suppression-added": {
+      "exempt_paths": ["tests/test_check_integrity.py"]
+    },
+    "bypass-added": {
+      "exempt_paths": ["tests/test_check_integrity.py"]
     }
   }
 }

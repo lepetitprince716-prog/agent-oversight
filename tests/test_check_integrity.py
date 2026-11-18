@@ -7,6 +7,8 @@ repositories hold skip markers and suppressions on purpose: they are the input.
 import importlib.util
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -506,15 +508,6 @@ class DiffEdgeCases(RepoCase):
         self.repo.commit(src__a_py="x = f()  # type: ignore\n")
         self.assertEqual(self.rules_at_head(), {("src/a.py", 1, "suppression-added", False)})
 
-    def test_merge_commit_uses_first_parent(self):
-        self.repo.commit(README_md="seed\n", src__a_py="a = 1\n", tests__test_s_py="def test_s():\n    assert 1\n")
-        self.repo.git("checkout", "-q", "-b", "side")
-        self.repo.commit(tests__test_s_py="@unittest.skip('x')\ndef test_s():\n    assert 1\n")
-        self.repo.git("checkout", "-q", "main")
-        self.repo.commit(src__a_py="a = 1  # noqa\n")
-        self.repo.git("merge", "-q", "--no-ff", "-m", "Merge side", "side")
-        self.assertEqual(self.rules_at_head(), {("tests/test_s.py", 1, "skip-added", False)})
-
     def test_one_line_hitting_two_rules_reports_both(self):
         self.repo.commit(tests__test_a_py="def test_a():\n    assert 1\n")
         self.repo.commit(tests__test_a_py="@unittest.skip('x')  # noqa\ndef test_a():\n    assert 1\n")
@@ -532,6 +525,129 @@ class DiffEdgeCases(RepoCase):
             with self.subTest(patch=patch):
                 with self.assertRaises(ci.IntegrityError):
                     ci.parse_patch("x", patch, deleted=False)
+
+
+def skipped(text, name="test_one"):
+    return text.replace(f"    def {name}", f"    @unittest.skip('x')\n    def {name}")
+
+
+class MergeCommits(RepoCase):
+    """A merge commit is judged by what the merge changed beyond the automatic merge
+    (git show --remerge-diff), not by everything the merged-in side brought."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.repo.commit(
+            "Seed", README_md="seed\n", src__a_py="a = 1\n", tests__test_s_py=BASE_TEST, tests__test_t_py=BASE_TEST
+        )
+
+    def branch_off(self, name="side"):
+        self.repo.git("checkout", "-q", "-b", name, self.base)
+
+    def merge(self, branch="side", message="Merge side", **resolution):
+        """Merge ``branch`` into main; a conflict is resolved with the given files."""
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", branch, check=False)
+        return self.repo.commit(message, **resolution)
+
+    def conflicting_sides(self, path="tests__test_s_py", text=BASE_TEST):
+        """Two branches that change the same line of one file differently."""
+        line = "        self.assertEqual(1, 1)\n"
+        self.branch_off()
+        self.repo.commit("Side", **{path: text.replace(line, line.rstrip() + "  # side\n")})
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("Main", **{path: text.replace(line, line.rstrip() + "  # main\n")})
+
+    def test_a_clean_merge_has_no_findings_whatever_the_merged_side_brought(self):
+        self.branch_off()
+        self.repo.commit(f"Park a test\n\n{REASON}", tests__test_s_py=skipped(BASE_TEST))
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit(f"Park another\n\n{REASON}", tests__test_t_py=skipped(BASE_TEST))
+        self.merge()
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 0 files)"), err)
+        code, out, err = self.repo.scan("--range", f"{self.base}..HEAD")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("3 commits", out)
+        self.assertIn("2 justified finding(s)", out)
+
+    def test_an_unjustified_commit_on_the_merged_side_is_still_reported_once_on_its_own_commit(self):
+        self.branch_off()
+        bad = self.repo.commit("Park a test", tests__test_s_py=skipped(BASE_TEST))
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("Touch readme", README_md="seed 2\n")
+        self.merge()
+        code, out, _ = self.repo.scan("--range", f"{self.base}..HEAD")
+        self.assertEqual(code, 1, out)
+        self.assertEqual([line.split()[0] for line in out.splitlines() if "skip-added" in line], [bad[:7]])
+
+    def test_a_skip_added_while_resolving_a_conflict_is_reported_on_the_merge(self):
+        self.conflicting_sides()
+        resolved = skipped(BASE_TEST).replace(
+            "        self.assertEqual(1, 1)\n",
+            "        self.assertEqual(1, 1)  # side\n        self.assertEqual(1, 1)  # main\n",
+        )
+        merge = self.merge(tests__test_s_py=resolved)
+        code, report = self.head_json()
+        found = {(f["where"], f["path"], f["rule"], f["justified"]) for f in report["findings"]}
+        self.assertEqual((code, found), (1, {(merge[:7], "tests/test_s.py", "skip-added", False)}))
+        self.repo.git("commit", "-q", "--amend", "-m", f"Merge side\n\n{REASON}")
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("1 justified finding(s)", out)
+
+    def test_conflict_markers_that_resolution_removes_are_not_findings(self):
+        self.repo.commit("Add the workflow", **{".github__workflows__ci_yml": "steps:\n  - run: make test\n"})
+        self.base = self.repo.git("rev-parse", "HEAD")
+        self.branch_off()
+        self.repo.commit("Side", **{".github__workflows__ci_yml": "steps:\n  - run: make test-a\n"})
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("Main", **{".github__workflows__ci_yml": "steps:\n  - run: make test-b\n"})
+        # the merging branch's line comes first, as in the conflicted file
+        self.merge(**{".github__workflows__ci_yml": "steps:\n  - run: make test-b\n  - run: make test-a\n"})
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 1 files)"), err)
+
+    def test_dropping_a_line_of_a_check_file_while_resolving_is_still_reported(self):
+        self.repo.commit("Add the workflow", **{".github__workflows__ci_yml": "steps:\n  - run: make test\n"})
+        self.base = self.repo.git("rev-parse", "HEAD")
+        self.branch_off()
+        self.repo.commit("Side", **{".github__workflows__ci_yml": "steps:\n  - run: make test-a\n"})
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("Main", **{".github__workflows__ci_yml": "steps:\n  - run: make test-b\n"})
+        self.merge(**{".github__workflows__ci_yml": "steps:\n  - run: make test-a\n"})
+        self.assertEqual(self.rule_names(), {"check-file-weakened"})
+
+    def test_an_octopus_merge_exits_2_instead_of_passing_unjudged(self):
+        for name in ("one", "two"):
+            self.branch_off(name)
+            self.repo.commit(f"Add {name}", **{f"src__{name}_py": "x = 1\n"})
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("merge", "-q", "--no-ff", "-m", "Octopus", "one", "two")
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 2, out)
+        self.assertIn("octopus", err)
+
+    def test_a_git_without_remerge_diff_exits_2_and_names_the_version(self):
+        self.branch_off()
+        self.repo.commit("Side", src__b_py="b = 1\n")
+        self.merge()
+        shim = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-oldgit"
+        shim.mkdir()
+        self.addCleanup(lambda: shutil.rmtree(shim, ignore_errors=True))
+        (shim / "git").write_text(
+            '#!/bin/sh\nfor arg in "$@"; do\n'
+            '  if [ "$arg" = "--version" ]; then echo "git version 2.30.0"; exit 0; fi\n'
+            f'done\nexec {shlex.quote(shutil.which("git"))} "$@"\n'
+        )
+        (shim / "git").chmod(0o755)
+        self.repo.env["PATH"] = f"{shim}{os.pathsep}{self.repo.env['PATH']}"
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--remerge-diff", err)
+        self.assertIn("2.36", err)
+        code, _, _ = self.repo.scan("--commit", "HEAD~1")
+        self.assertEqual(code, 0, "a commit with one parent needs no remerge-diff")
 
 
 class RangeAndErrors(RepoCase):
@@ -983,6 +1099,53 @@ class Overlay(RepoCase):
         self.repo.commit(**{".githooks/pre-push": "git push --no-verify\n"})
         self.assertIn("bypass-added", self.rule_names())
 
+    def test_exempt_paths_spare_the_matching_files_of_that_rule_only(self):
+        self.repo.commit(tests__test_other_py=BASE_TEST)
+        self.overlay({"version": 1, "rules": {"skip-added": {"exempt_paths": ["tests/test_thing.py"]}}})
+        self.skip_commit()
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 1 files)"))
+        self.repo.commit(tests__test_other_py=skipped(BASE_TEST))
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 1, out)
+        self.assertIn("tests/test_other.py:4 skip-added", out)
+        # the file stays under every other rule
+        self.repo.commit(tests__test_thing_py="import unittest\n")
+        self.assertEqual(self.rule_names(), {"test-removed", "assertion-loss"})
+
+    def test_exempt_paths_are_globs_and_a_rename_needs_both_paths_to_match(self):
+        self.repo.commit(tests__test_other_py=BASE_TEST)
+        self.overlay({"version": 1, "rules": {"skip-added": {"exempt_paths": ["tests/test_t*.py"]}}})
+        self.repo.git("mv", "tests/test_thing.py", "tests/test_tx.py")
+        self.repo.commit(tests__test_tx_py=skipped(BASE_TEST))
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, "both paths match the glob:\n" + out)
+        self.repo.git("mv", "tests/test_tx.py", "tests/test_renamed.py")
+        self.repo.commit(tests__test_renamed_py=skipped(BASE_TEST, "test_two"))
+        self.assertEqual(self.rule_names(), {"skip-added"}, "the new path is not exempt")
+        self.repo.git("mv", "tests/test_other.py", "tests/test_ty.py")
+        self.repo.commit(tests__test_ty_py=skipped(BASE_TEST))
+        self.assertEqual(self.rule_names(), {"skip-added"}, "the old path is not exempt")
+
+    def test_exempt_paths_work_for_the_deletion_and_net_loss_rules(self):
+        self.overlay(
+            {
+                "version": 1,
+                "rules": {
+                    "test-removed": {"exempt_paths": ["tests/test_thing.py"]},
+                    "assertion-loss": {"exempt_paths": ["tests/test_thing.py"]},
+                },
+            }
+        )
+        self.repo.commit(tests__test_thing_py=None)
+        self.assertEqual(self.rules_at_head(), set())
+        self.repo.commit(tests__test_thing_py=BASE_TEST)
+        self.repo.commit(tests__test_thing_py="import unittest\n")
+        self.assertEqual(self.rules_at_head(), set())
+        self.repo.commit(tests__test_other_py=BASE_TEST)
+        self.repo.commit(tests__test_other_py="import unittest\n")
+        self.assertEqual(self.rule_names(), {"test-removed", "assertion-loss"})
+
     def test_overlay_is_found_from_a_subfolder_of_the_repository(self):
         self.overlay({"rules": {"skip-added": {"severity": "note"}}})
         self.skip_commit()
@@ -1004,12 +1167,15 @@ class Overlay(RepoCase):
             json.dumps({"version": 2, "rules": {}}): "must be 1",
             json.dumps({"version": 1, "rules": {}, "classes": {}}): "unknown key(s): classes",
             json.dumps({"version": 1, "rules": {"no-such-rule": {"severity": "note"}}}): "no-such-rule",
-            json.dumps({"version": 1, "rules": {"skip-added": {"patterns": ["x"]}}}): "only ['allow', 'severity']",
-            json.dumps({"version": 1, "rules": {"skip-added": {"why": "w"}}}): "only ['allow', 'severity']",
+            json.dumps({"version": 1, "rules": {"skip-added": {"patterns": ["x"]}}}): "only ['allow', 'exempt_paths', 'severity']",
+            json.dumps({"version": 1, "rules": {"skip-added": {"why": "w"}}}): "only ['allow', 'exempt_paths', 'severity']",
             json.dumps({"version": 1, "rules": {"skip-added": {"severity": "off"}}}): "severity must be",
             json.dumps({"version": 1, "rules": {"skip-added": {"allow": ["("]}}}): "invalid pattern",
             json.dumps({"version": 1, "rules": {"skip-added": {"allow": "x"}}}): "list of non-empty strings",
             json.dumps({"version": 1, "rules": []}): "keyed by rule id",
+            json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": "tests/x.py"}}}): "list of non-empty strings",
+            json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": [""]}}}): "list of non-empty strings",
+            json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": [3]}}}): "list of non-empty strings",
         }
         for text, expected in cases.items():
             with self.subTest(overlay=text):
@@ -1042,8 +1208,8 @@ class Overlay(RepoCase):
 
 
 class OwnOverlay(RepoCase):
-    """This repository's own .check-integrity.json spares the marker strings that the scanner's
-    tests hold as data, and nothing else of that file."""
+    """This repository's own .check-integrity.json exempts the scanner's test file from the rules
+    that look for marker strings, which that file holds as data, and nothing else of it."""
 
     OVERLAY = Path(__file__).resolve().parent.parent / ".check-integrity.json"
     TEST_FILE = Path(__file__).resolve()
@@ -1098,9 +1264,183 @@ class OwnOverlay(RepoCase):
         for rule in ("test-removed", "assertion-loss"):
             self.assertEqual(self.scan_head()[0], 1, rule)
 
+    def test_a_skip_in_another_test_file_is_reported_even_when_its_reason_has_a_newline_escape(self):
+        self.repo.commit(tests__test_other_py=BASE_TEST)
+        self.repo.commit(
+            tests__test_other_py=BASE_TEST.replace("    def test_two", "    @unittest.skip('a\\nb')\n    def test_two")
+        )
+        self.assertIn(("tests/test_other.py", "skip-added"), self.found())
+        self.assertEqual(self.scan_head()[0], 1)
+
+    def test_the_overlay_sets_nothing_but_exempt_paths(self):
+        document = json.loads(self.OVERLAY.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {rule: sorted(change) for rule, change in document["rules"].items()},
+            {rule: ["exempt_paths"] for rule in ("skip-added", "suppression-added", "bypass-added")},
+        )
+        for change in document["rules"].values():
+            self.assertEqual(change["exempt_paths"], ["tests/test_check_integrity.py"])
+
     def found(self):
         code, out, _ = self.repo.scan("--commit", "HEAD", "--overlay", str(self.OVERLAY), "--json")
         return {(f["path"], f["rule"]) for f in json.loads(out)["findings"]}
+
+
+class OverlayGuard(RepoCase):
+    """A change to .check-integrity.json, the overlay itself, needs a reason line: any added or
+    removed line, a new file or a deleted one. The overlay cannot waive that."""
+
+    OVERLAY = ".check-integrity.json"
+
+    def setUp(self):
+        super().setUp()
+        self.repo.commit(tests__test_thing_py=BASE_TEST, src__a_py="x = 1\n")
+
+    def findings(self):
+        code, report = self.head_json()
+        return code, {(f["path"], f["rule"], f["justified"]) for f in report["findings"]}
+
+    def test_a_new_overlay_needs_a_reason_line(self):
+        self.repo.commit("Add the overlay", **{self.OVERLAY: '{\n  "version": 1\n}\n'})
+        self.assertEqual(self.findings(), (1, {(self.OVERLAY, "overlay-changed", False)}))
+        self.repo.git("commit", "-q", "--amend", "-m", f"Add the overlay\n\n{REASON}")
+        self.assertEqual(self.findings(), (0, {(self.OVERLAY, "overlay-changed", True)}))
+
+    def test_adding_a_line_to_an_overlay_needs_a_reason_line(self):
+        self.repo.commit("Add the overlay", **{self.OVERLAY: '{\n  "version": 1,\n  "rules": {\n  }\n}\n'})
+        self.repo.commit(
+            "Exempt a file",
+            **{
+                self.OVERLAY: '{\n  "version": 1,\n  "rules": {\n'
+                '    "skip-added": {"exempt_paths": ["tests/*"]}\n  }\n}\n'
+            },
+        )
+        self.assertEqual(self.findings(), (1, {(self.OVERLAY, "overlay-changed", False)}))
+
+    def test_removing_a_line_or_the_whole_file_needs_a_reason_line(self):
+        self.repo.commit("Add the overlay", **{self.OVERLAY: '{\n  "version": 1,\n  "rules": {}\n}\n'})
+        self.repo.commit("Shorten it", **{self.OVERLAY: '{\n  "version": 1\n}\n'})
+        code, found = self.findings()
+        self.assertEqual(code, 1)
+        self.assertIn((self.OVERLAY, "overlay-changed", False), found)
+        self.repo.commit("Drop it", **{self.OVERLAY: None})
+        code, found = self.findings()
+        self.assertEqual(code, 1)
+        self.assertIn((self.OVERLAY, "overlay-changed", False), found)
+
+    def test_an_empty_new_overlay_counts_too(self):
+        self.repo.commit("Add an empty overlay", **{self.OVERLAY: ""})
+        code, out, _ = self.repo.scan("--commit", "HEAD", "--no-overlay")
+        self.assertEqual(code, 1, out)
+        self.assertIn("overlay-changed", out)
+
+    def test_only_the_overlay_at_the_top_of_the_repository_is_guarded(self):
+        self.repo.commit("A file with that name elsewhere", **{f"sub/{self.OVERLAY}": "{}\n"})
+        self.assertNotIn("overlay-changed", self.rule_names())
+
+    def test_the_staged_overlay_is_judged_with_the_commit_message(self):
+        self.repo.write(self.OVERLAY, '{\n  "version": 1\n}\n')
+        self.repo.git("add", self.OVERLAY)
+        code, out, _ = self.repo.scan("--staged")
+        self.assertEqual(code, 1, out)
+        self.assertIn("staged .check-integrity.json:1 overlay-changed", out)
+        message = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-message"
+        message.write_text(f"Add the overlay\n\n{REASON}\n")
+        self.addCleanup(message.unlink)
+        code, out, _ = self.repo.scan("--staged", "--message-file", str(message))
+        self.assertEqual(code, 0, out)
+
+    def test_the_overlay_cannot_change_that_rule(self):
+        for change in ({"severity": "note"}, {"allow": ["x"]}, {"exempt_paths": [".check-integrity.json"]}):
+            with self.subTest(change=change):
+                text = json.dumps({"rules": {"overlay-changed": change}})
+                self.repo.commit("Set the overlay", **{self.OVERLAY: text})
+                code, out, err = self.repo.scan("--commit", "HEAD")
+                self.assertEqual(code, 2, out)
+                self.assertIn("overlay-changed", err)
+                self.assertIn("cannot", err)
+
+
+class CiScanStep(unittest.TestCase):
+    """The check-integrity step of .github/workflows/ci.yml, run as the shell script it is, in a
+    throwaway repository: a push to the default branch is skipped, any other push and every pull
+    request is scanned."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def step_script(cls):
+        lines = (cls.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
+        start = next(n for n, line in enumerate(lines) if line.strip().startswith("- name: Check-integrity scan"))
+        run = next(n for n in range(start, len(lines)) if lines[n].strip() == "run: |")
+        indent = len(lines[run + 1]) - len(lines[run + 1].lstrip())
+        body = []
+        for line in lines[run + 1 :]:
+            if line.strip() and len(line) - len(line.lstrip()) < indent:
+                break
+            body.append(line[indent:])
+        return "\n".join(body) + "\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        (base / "work").mkdir()
+        (base / "runner").mkdir()
+        self.runner_temp = base / "runner"
+        self.repo = Repo(base / "work")
+        for name in ("check_integrity.py", "check_integrity_rules.json"):
+            self.repo.write(f"tools/{name}", (self.ROOT / "tools" / name).read_bytes())
+        self.base_sha = self.repo.commit("Seed", tests__test_thing_py=BASE_TEST)
+        self.bad = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        self.repo.git("update-ref", "refs/remotes/origin/main", self.base_sha)
+
+    def run_step(self, **variables):
+        values = {
+            "RUNNER_TEMP": str(self.runner_temp),
+            "BASE_REF": "",
+            "PR_HEAD": "",
+            "BEFORE": self.base_sha,
+            "AFTER": self.bad,
+            "REF": "refs/heads/main",
+            "DEFAULT_BRANCH": "main",
+        }
+        values.update(variables)
+        done = subprocess.run(
+            ["bash", "-e", "-c", self.step_script()],
+            cwd=self.repo.root,
+            env={**self.repo.env, **values},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return done.returncode, done.stdout + done.stderr
+
+    def test_a_push_to_the_default_branch_is_skipped_with_a_reason(self):
+        code, out = self.run_step()
+        self.assertEqual(code, 0, out)
+        self.assertIn("default branch", out)
+        self.assertNotIn("skip-added", out)
+
+    def test_a_push_to_another_branch_is_scanned(self):
+        code, out = self.run_step(REF="refs/heads/feature")
+        self.assertEqual(code, 1, out)
+        self.assertIn("skip-added", out)
+
+    def test_the_default_branch_comes_from_the_repository_not_from_the_script(self):
+        code, out = self.run_step(DEFAULT_BRANCH="trunk")
+        self.assertEqual(code, 1, "main is an ordinary branch here:\n" + out)
+        code, out = self.run_step(DEFAULT_BRANCH="trunk", REF="refs/heads/trunk")
+        self.assertEqual(code, 0, out)
+
+    def test_a_pull_request_is_scanned_even_when_it_targets_the_default_branch(self):
+        code, out = self.run_step(BASE_REF="main", PR_HEAD=self.bad, REF="refs/pull/7/merge")
+        self.assertEqual(code, 1, out)
+        self.assertIn("skip-added", out)
+
+    def test_the_first_push_of_a_branch_is_scanned_too(self):
+        code, out = self.run_step(REF="refs/heads/feature", BEFORE="0" * 40)
+        self.assertEqual(code, 1, out)
 
 
 class PushRefs(RepoCase):

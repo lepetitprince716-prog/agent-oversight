@@ -7,8 +7,10 @@ from check configuration. Such a change is allowed only when its commit message 
 a top-level line ``Check-change: <reason of 20 or more characters>``; one line covers
 every finding of that commit. The rules live in ``check_integrity_rules.json``. A rule has
 a severity: ``block`` (the default) needs that line, ``note`` is printed and counted but
-never fails the run. A repository can adjust severities and add ``allow`` patterns in its own
-``.check-integrity.json`` (see ``load_overlay``).
+never fails the run. A repository can adjust severities, add ``allow`` patterns and exempt
+paths in its own ``.check-integrity.json`` (see ``load_overlay``); any change to that file is
+itself a blocking finding (rule ``overlay-changed``). A merge commit is judged by what the
+merge changed beyond the automatic merge (``git show --remerge-diff``, git 2.36 or newer).
 
 Exit status: 0 no blocking finding, or every one justified; 1 an unjustified blocking
 finding; 2 usage or git error. The guard fails closed: an unreadable rules file, a failed git call or a
@@ -19,6 +21,8 @@ can be copied into another repository together with its rules file.
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import functools
 import json
 import os
 import re
@@ -52,7 +56,13 @@ BLOCK, NOTE = "block", "note"
 SEVERITIES = frozenset({BLOCK, NOTE})
 OVERLAY_NAME = ".check-integrity.json"
 OVERLAY_KEYS = frozenset({"version", "rules"})
-OVERLAY_RULE_KEYS = frozenset({"severity", "allow"})
+OVERLAY_RULE_KEYS = frozenset({"severity", "allow", "exempt_paths"})
+# A change to the overlay file is judged by the scanner itself, not by a rule of the rules
+# file, and the overlay cannot touch it: otherwise a commit could loosen its own judge.
+OVERLAY_GUARD = "overlay-changed"
+REMERGE_DIFF_GIT = (2, 36)
+# The conflict markers a merge resolution removes; they are not content the author dropped.
+CONFLICT_MARKER = re.compile(r"^(<{7}|>{7}|\|{7})( .*)?$|^={7}$")
 
 JUSTIFICATION = re.compile(r"Check-change:(.*)")
 MIN_REASON = 20
@@ -94,6 +104,15 @@ class Rule:
     existing_only: bool = False
     spare_with_source: bool = False
     severity: str = BLOCK
+    exempt_paths: tuple[str, ...] = ()
+
+    def exempts(self, diff: FileDiff) -> bool:
+        """True if the overlay exempts this file from the rule. A renamed file needs both its
+        paths to match, so a move cannot carry a file into or out of an exemption."""
+        paths = [path for path in (diff.path, diff.old_path) if path is not None]
+        return bool(self.exempt_paths) and all(
+            any(fnmatch.fnmatchcase(path, glob) for glob in self.exempt_paths) for path in paths
+        )
 
     def skips(self, line: str) -> bool:
         return any(skip.search(line) for skip in self.skip_lines)
@@ -133,11 +152,15 @@ class RuleSet:
         )
 
 
-def compile_list(raw: object, where: str) -> tuple[re.Pattern[str], ...]:
+def string_list(raw: object, where: str) -> list[str]:
     if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
         raise IntegrityError(f"{where}: must be a list of non-empty strings")
+    return raw
+
+
+def compile_list(raw: object, where: str) -> tuple[re.Pattern[str], ...]:
     compiled = []
-    for number, item in enumerate(raw, start=1):
+    for number, item in enumerate(string_list(raw, where), start=1):
         try:
             compiled.append(re.compile(item))
         except re.error as exc:
@@ -208,10 +231,12 @@ def load_rules(path: Path) -> RuleSet:
 
 def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
     """Apply a repository's own ``.check-integrity.json`` to the rules. The file is
-    ``{"version": 1, "rules": {"<rule id>": {"severity": "note", "allow": ["<regex>"]}}}``:
-    per rule id it may set the severity and append allow-regexes, and nothing else. Any other
-    key, or an id the rules do not have, is an error, so the file cannot quietly change more
-    than that."""
+    ``{"version": 1, "rules": {"<rule id>": {"severity": "note", "allow": ["<regex>"],
+    "exempt_paths": ["<glob>"]}}}``: per rule id it may set the severity, append allow-regexes
+    and exempt files, whose repository-relative path matches a glob (``fnmatch`` rules: ``*``
+    also matches ``/``), from the rule. Nothing else. Any other key, or an id the rules do not
+    have, is an error, so the file cannot quietly change more than that. The ``overlay-changed``
+    rule cannot be set at all."""
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -226,9 +251,14 @@ def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
         raise IntegrityError(f"{path}: 'rules' must be an object keyed by rule id")
     known = {rule.id for rule in rules.rules}
     allow: dict[str, tuple[re.Pattern[str], ...]] = {}
+    exempt: dict[str, tuple[str, ...]] = {}
     severity: dict[str, str] = {}
     for rule_id, change in changes.items():
         where = f"{path}: rule {rule_id}"
+        if rule_id == OVERLAY_GUARD:
+            raise IntegrityError(
+                f"{where}: the overlay cannot change this rule; any change to {OVERLAY_NAME} needs a reason line"
+            )
         if rule_id not in known:
             raise IntegrityError(f"{where}: no such rule (known: {', '.join(sorted(known))})")
         if not isinstance(change, dict) or set(change) - OVERLAY_RULE_KEYS:
@@ -239,6 +269,8 @@ def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
             severity[rule_id] = change["severity"]
         if "allow" in change:
             allow[rule_id] = compile_list(change["allow"], f"{where} allow")
+        if "exempt_paths" in change:
+            exempt[rule_id] = tuple(string_list(change["exempt_paths"], f"{where} exempt_paths"))
     return RuleSet(
         rules.classes,
         tuple(
@@ -246,6 +278,7 @@ def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
                 rule,
                 severity=severity.get(rule.id, rule.severity),
                 allow=rule.allow + allow.get(rule.id, ()),
+                exempt_paths=rule.exempt_paths + exempt.get(rule.id, ()),
             )
             for rule in rules.rules
         ),
@@ -369,10 +402,10 @@ def git(args: list[str]) -> bytes:
 DIFF_FLAGS = ["--find-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"]
 
 
-def changed_files(base: list[str]) -> list[tuple[str, str, str | None]]:
-    """``(status, path, old_path)`` for each changed file, from ``git diff --raw -z``.
+def changed_files(command: list[str], base: list[str]) -> list[tuple[str, str, str | None]]:
+    """``(status, path, old_path)`` for each changed file, from ``git <command> --raw -z``.
     A rename carries its old path; a copy counts as an added file."""
-    fields = git(["diff", "--raw", "-z", *DIFF_FLAGS, *base]).split(b"\0")
+    fields = git([*command, "--raw", "-z", *DIFF_FLAGS, *base]).split(b"\0")
     if fields and fields[-1] == b"":
         fields.pop()
     files: list[tuple[str, str, str | None]] = []
@@ -397,14 +430,33 @@ def changed_files(base: list[str]) -> list[tuple[str, str, str | None]]:
     return files
 
 
-def collect(base: list[str]) -> list[FileDiff]:
-    """Parse every changed file of one diff, one git call per file."""
+def collect(base: list[str], merge: bool = False) -> list[FileDiff]:
+    """Parse every changed file of one diff, one git call per file. ``merge`` is for the one
+    id of a merge commit: its diff is what the merge changed beyond the automatic merge, with
+    the conflict markers that the resolution removed left out."""
+    command = ["show", "--format=", "--remerge-diff"] if merge else ["diff"]
     diffs = []
-    for status, path, old_path in changed_files(base):
+    for status, path, old_path in changed_files(command, base):
         paths = [old_path, path] if old_path else [path]
-        patch = git(["diff", "-p", "-U0", *DIFF_FLAGS, *base, "--", *paths])
-        diffs.append(parse_patch(path, patch, status=status, old_path=old_path))
+        patch = git([*command, "-p", "-U0", *DIFF_FLAGS, *base, "--", *paths])
+        diff = parse_patch(path, patch, status=status, old_path=old_path)
+        if merge:
+            diff.removed = [line for line in diff.removed if not CONFLICT_MARKER.match(line.text)]
+        diffs.append(diff)
     return diffs
+
+
+@functools.lru_cache(maxsize=1)
+def require_remerge_diff() -> None:
+    """A merge commit is judged with ``git show --remerge-diff``; an older git, or one whose
+    version cannot be read, ends the run instead of judging the merge some other way."""
+    need = ".".join(map(str, REMERGE_DIFF_GIT))
+    found = re.search(r"(\d+)\.(\d+)", git(["--version"]).decode("utf-8", "replace"))
+    if found is None or (int(found.group(1)), int(found.group(2))) < REMERGE_DIFF_GIT:
+        raise IntegrityError(
+            f"a merge commit needs git {need} or newer for --remerge-diff (this git: "
+            f"{found.group(0) if found else 'version unreadable'})"
+        )
 
 
 def empty_tree() -> str:
@@ -429,10 +481,19 @@ def resolve(rev: str) -> str:
     return git(["rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}"]).decode().strip()
 
 
-def first_parent(oid: str) -> str:
-    """The first parent of a commit, or the empty tree for a root commit."""
+def collect_commit(oid: str) -> list[FileDiff]:
+    """The changes of one commit: against its parent, against the empty tree for a root
+    commit, and for a merge commit against the automatic merge of its parents."""
     parents = git(["rev-list", "--parents", "-n", "1", oid]).decode().split()[1:]
-    return parents[0] if parents else empty_tree()
+    if len(parents) > 2:
+        raise IntegrityError(
+            f"{oid[:SHORT]} is an octopus merge ({len(parents)} parents): git has no --remerge-diff for it, "
+            "so it cannot be judged"
+        )
+    if len(parents) == 2:
+        require_remerge_diff()
+        return collect([oid], merge=True)
+    return collect([parents[0] if parents else empty_tree(), oid])
 
 
 def commit_message(oid: str) -> str:
@@ -593,7 +654,7 @@ def net_loss_hits(diffs: list[FileDiff], rule: Rule, rules: RuleSet) -> list[Hit
     total = 0
     hits = []
     for diff in diffs:
-        if diff.deleted or not rules.classes_of(diff.path).intersection(rule.classes):
+        if diff.deleted or rule.exempts(diff) or not rules.classes_of(diff.path).intersection(rule.classes):
             continue
         lost = [l for l in diff.removed if rule.matches(l.text)]
         gained = sum(1 for l in diff.added if rule.matches(l.text))
@@ -608,6 +669,8 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
     classes = rules.classes_of(diff.path)
     hits: list[Hit] = []
     for rule in rules.rules:
+        if rule.exempts(diff):
+            continue
         if rule.kind == "deleted":
             if gone(diff, rule, rules) and not (rule.spare_with_source and spared(diff, diffs)):
                 hits.append(Hit(diff.path, 0, rule.id, "(file deleted)"))
@@ -625,9 +688,24 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
     return hits
 
 
+def overlay_hits(diffs: list[FileDiff]) -> list[Hit]:
+    """One hit for each change to the overlay file at the top of the repository: a line added
+    or removed, the file created, deleted or moved. The overlay is what the other rules are
+    judged by, so changing it is never free."""
+    hits = []
+    for diff in diffs:
+        if OVERLAY_NAME not in (diff.path, diff.old_path):
+            continue
+        lines = diff.added or diff.removed
+        if lines or diff.status != "M":
+            first = lines[0] if lines else Line(0, "(file added, deleted or moved)")
+            hits.append(Hit(diff.path, first.number, OVERLAY_GUARD, first.text))
+    return hits
+
+
 def judge_change(diffs: list[FileDiff], rules: RuleSet) -> list[Hit]:
     """Every rule that fires on one change, in diff order; a rule fires once per line."""
-    hits = [hit for diff in diffs for hit in judge_file(diff, diffs, rules)]
+    hits = [hit for diff in diffs for hit in judge_file(diff, diffs, rules)] + overlay_hits(diffs)
     for rule in rules.rules:
         if rule.kind == "net-loss":
             hits += net_loss_hits(diffs, rule, rules)
@@ -691,7 +769,7 @@ def run(args: argparse.Namespace, rules: RuleSet) -> Report:
     findings: list[Finding] = []
     files = 0
     for oid in commits:
-        diffs = collect([first_parent(oid), oid])
+        diffs = collect_commit(oid)
         files += len(diffs)
         findings += judge(oid[:SHORT], diffs, commit_message(oid), rules)
     return Report(findings, len(commits), files, False)
@@ -712,7 +790,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--staged", action="store_true", help="scan the staged diff")
-    mode.add_argument("--commit", metavar="REV", help="scan one commit against its first parent")
+    mode.add_argument(
+        "--commit",
+        metavar="REV",
+        help="scan one commit against its parent; a merge commit against the automatic merge",
+    )
     mode.add_argument("--range", metavar="A..B", help="scan each commit in the range")
     mode.add_argument(
         "--pre-push",

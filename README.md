@@ -136,7 +136,7 @@ routine.
 
 ```bash
 python3 tools/check_integrity.py --staged --message-file .git/COMMIT_EDITMSG   # what a commit-msg hook runs
-python3 tools/check_integrity.py --commit HEAD                                 # one commit
+python3 tools/check_integrity.py --commit HEAD                                 # one commit (a merge: see below)
 python3 tools/check_integrity.py --range origin/main..HEAD                     # each commit in a range
 python3 tools/check_integrity.py --pre-push < refs                             # the lines git gives a pre-push hook
 ```
@@ -146,12 +146,22 @@ finding, 2 means the tool could not do its job (an unreadable rules file, a fail
 diff it cannot parse): it never passes by default. `--json` prints the same report for a
 program, with a level on each finding.
 
+A merge commit is judged by what the merge changed beyond the automatic merge
+(`git show --remerge-diff`), so a clean merge has no findings and the commits it brought in are
+judged on their own, once. A resolution that adds a skip or drops a check line is reported on the
+merge; the conflict markers a resolution removes are not. This needs git 2.36 or newer: with an
+older git, or for an octopus merge (three or more parents, which git cannot remerge-diff), the run
+exits 2 and says so, instead of judging the merge some other way. `--staged` on a commit that
+concludes a merge still compares with the first parent.
+
 ### Adjusting the rules for one repository
 
 A `.check-integrity.json` at the top of a repository is laid over the rules. Per rule id it may
-set `severity` and append `allow` regexes, nothing else; any other key, or an id the rules do
-not have, is an error (exit 2). `allow` regexes are tried at the start of each pattern match,
-in every file the rule covers.
+change `severity`, append `allow` regexes and list `exempt_paths`, nothing else; any other key, or
+an id the rules do not have, is an error (exit 2). `allow` regexes are tried at the start of each
+pattern match, in every file the rule covers. `exempt_paths` are globs on the repository-relative
+path (`fnmatch` rules: `*` also matches `/`); a file that matches one is not judged by that rule
+at all. A renamed file is exempt only when its old and its new path both match.
 
 ```json
 {
@@ -163,13 +173,16 @@ in every file the rule covers.
 }
 ```
 
-The file is itself a check file: removing a line from it needs a `Check-change:` line like any
-other weakening. `--overlay PATH` reads another file, and `--no-overlay` reads none.
+The file is itself guarded: any change to it (a line added or removed, the file created or
+deleted) is a blocking finding of the scanner's own rule `overlay-changed` and needs a
+`Check-change:` line, so a commit cannot loosen the rules it is judged by without saying why.
+The overlay cannot change, lower or exempt that rule (exit 2). `--overlay PATH` reads another
+file, and `--no-overlay` reads none.
 
-This repository's own file spares the marker strings that the scanner's tests hold as data: a
-`skip-added` match on a line that also holds a literal `\n`, or that sits right after the
-scanner's own output text. Editing those strings needs no reason line; deleting a test or an
-assertion still does.
+This repository's own file exempts `tests/test_check_integrity.py` from `skip-added`,
+`suppression-added` and `bypass-added`: that file holds marker strings as data. Editing those
+strings needs no reason line; deleting a test or an assertion there still does, and so does a
+skip added in any other test file.
 
 ### Using it in another repository
 
@@ -186,8 +199,11 @@ python3 tools/check_integrity.py --staged --message-file "$1"
 
 For a pre-push hook, pipe git's standard input into `--pre-push`; a new branch is scanned for
 the commits that no remote-tracking branch has. [.github/workflows/ci.yml](.github/workflows/ci.yml)
-runs the same scan on every push and pull request, taking the scanner, its rules and
-`.check-integrity.json` from the base branch on a pull request.
+runs the same scan on every pull request and on every push to a branch other than the default
+branch, taking the scanner, its rules and `.check-integrity.json` from the base branch on a pull
+request. A push to the default branch is not scanned: merging a pull request leaves commits that
+carry none of the `Check-change:` lines of the commits it was made of, and the pull request was
+already judged commit by commit. The local pre-push hook still scans a direct push.
 
 ## The templates
 
