@@ -380,9 +380,12 @@ has nothing to scan and says so.
     so it is not reported.
   - A base class written as an expression (`unittest.TestCase.__base__`, which is `object`) is not
     reported: the class line still holds the word `TestCase`, so no class counts as lost.
-  - A file the change adds is not judged. A new `conftest.py`, or a new `tests/__init__.py`, that
-    replaces the assertion methods when it is imported turns the whole suite green and is not
-    reported.
+  - No rule judges what a file the change adds does when it runs. A new `conftest.py`, or a new
+    `tests/__init__.py`, that replaces the assertion methods when it is imported turns the whole
+    suite green and is not reported. The rules for added lines do read a new file, with two
+    exceptions: `skip-added` leaves a new test file alone, and the entry of `check-file-weakened`
+    for added lines leaves a new lint or test configuration alone, so a new `pytest.ini` whose
+    `addopts` holds `--collect-only` is not reported.
   - A constant-false condition is recognized in four forms only: `if False:`, `if 0:`,
     `if (false) {` and `if false {`. `else if (false)`, `if (0)` and `if (False):` are not.
   - `coverageThreshold` in `package.json` and in `jest.config.*` is not watched. `package.json`
@@ -396,11 +399,16 @@ has nothing to scan and says so.
     is not).
   - The collected names are the union of several runners' patterns, not the rule of this
     repository's runner. `test_x.py` renamed to `x_test.py` counts as collected before and after,
-    while `unittest discover` with its default pattern `test*.py` no longer collects the new name
-    (a failing test, then `Ran 0 tests` and OK); a name like `testx.py` was never a collected
-    name to the scanner.
-  - A test moved into a file the same commit creates, under a name no runner collects, is not
-    reported, because a file the change adds is not judged. A rename out of collection or a
+    while `unittest discover` with its default pattern `test*.py` no longer collects the new name:
+    its tests stop running and nothing fails (when it was the only test file, Python 3.11 prints
+    `Ran 0 tests` and OK, and 3.13 exits 5 with `NO TESTS RAN`). For Python the scanner's names
+    are `test_*.py` and `*_test.py`, not unittest's `test*.py`: `testx.py` renamed to `helper.py`
+    in its directory is not reported although unittest stops collecting it, and `test_x.py`
+    renamed to `testx.py` is reported although unittest still collects it.
+  - A test moved into another file under a test directory whose name no runner collects
+    (`tests/support.py`, new or already there) is not reported: lost tests and assertions are
+    counted over every file of the class `test`, and every file under `tests/` is in it. Moved to
+    a file outside every test directory it is reported. A rename out of collection or a
     deletion of a test file is let through when the same commit deletes a file named like its source
     (`util.py` for `test_util.py`), in any directory, whether or not that is the file it tests.
 - Changes that lose nothing but need a reason line:

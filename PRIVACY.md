@@ -40,8 +40,10 @@ was not enough.
    are taken from the base branch on a pull request, so a change cannot loosen the rules it is
    judged by; on a push the scan runs the scanner of the pushed commit, and the commit check,
    which runs first, reports a change to it. A change can still edit the workflow file, and
-   GitHub runs the changed copy of that, on the pull request and again after the merge: nothing
-   in CI reports it, so read every change under `.github/` before it merges. CI runs after the content has
+   GitHub runs the changed copy of that, on the pull request and again after the merge. The
+   commit check reports such a change while the change leaves that step working; one that
+   rewrites or removes the step is reported by nothing in CI, so read every change under
+   `.github/` before it merges. CI runs after the content has
    reached GitHub: it catches what slipped past the hooks and what other people send, and it
    cannot undo a push.
 

@@ -233,7 +233,9 @@ pre-push 钩子把 git 给的标准输入接到 `--pre-push`，并传远端的�
 - 规则看不到的、关掉测试或检查的其他办法：
   - 在测试函数里加一行 `yield`，函数变成生成器，运行器不再执行函数体。按行读的规则分不出它和普通 `yield` 夹具，所以不报。
   - 基类写成表达式（`unittest.TestCase.__base__`，实际是 `object`）不报：类定义行里还有 `TestCase` 这个词，不算丢了一个类。
-  - 改动新增的文件不判。新的 `conftest.py` 或 `tests/__init__.py` 在导入时把断言方法换掉，整套测试会变绿，而不被报。
+  - 新增的文件运行起来做什么，没有规则去判。新的 `conftest.py` 或 `tests/__init__.py` 在导入时把断言方法换掉，整套测试会变绿，而不被报。
+    看新增行的规则会读新文件，有两处例外：`skip-added` 不看新的测试文件；`check-file-weakened` 看新增行的那一条不看新的 lint 或测试配置，
+    所以新建一个 `addopts` 里带 `--collect-only` 的 `pytest.ini` 不报。
   - 恒假条件只认四种写法：`if False:`、`if 0:`、`if (false) {`、`if false {`。`else if (false)`、`if (0)`、`if (False):` 不认。
   - `package.json` 和 `jest.config.*` 里的 `coverageThreshold` 不在看守范围里：`package.json` 属于 `script` 类，那一类没有看改写的规则；
     `jest.config.*` 不属于任何类。
@@ -241,9 +243,11 @@ pre-push 钩子把 git 给的标准输入接到 `--pre-push`，并传远端的�
     例如拼出 `pytest --collect-only` 命令的 Python 源文件。它们是一张单子，不是所有同类参数：pytest 的 `--setup-plan`、`--setup-only`
     同样让测试一条不跑，却不在单子上；`--passWithNoTests` 只认这一种写法（`--pass-with-no-tests` 不认）。
   - 「会被收集的名字」是几种测试运行器的规则的并集，不是这个仓库自己的运行器的规则。`test_x.py` 改名成 `x_test.py`，扫描器认为前后都被收集，
-    而 `unittest discover` 的默认模式 `test*.py` 不再收集新名字（一条失败的测试，改名后是 `Ran 0 tests`、OK）；`testx.py` 这样的名字，
-    扫描器本来就不当收集名。
-  - 把一条测试挪进同一次提交新建、名字不被收集的文件，不报，因为改动新增的文件不判。改名出收集范围或删掉一个测试文件，只要同一次提交里
+    而 `unittest discover` 的默认模式 `test*.py` 不再收集新名字：里面的测试不再跑，也没有东西失败（它是唯一的测试文件时，Python 3.11 打印
+    `Ran 0 tests` 和 OK，3.13 以退出码 5 结束并打印 `NO TESTS RAN`）。对 Python，扫描器认的名字是 `test_*.py` 和 `*_test.py`，不是 unittest 的
+    `test*.py`：`testx.py` 在原目录改名成 `helper.py` 不报，尽管 unittest 不再收集它；`test_x.py` 改名成 `testx.py` 会报，尽管 unittest 照样收集它。
+  - 把一条测试挪进测试目录下另一个名字不被收集的文件（`tests/support.py`，新建的或原来就有的），不报：丢掉的测试和断言是在 `test` 类的
+    所有文件上合起来数的，而 `tests/` 下的每个文件都属于这一类。挪到所有测试目录之外的文件就会报。改名出收集范围或删掉一个测试文件，只要同一次提交里
     删掉了一个和它的源文件同名的文件（`test_util.py` 对 `util.py`）就放行，不管它在哪个目录，也不管它是不是这个测试测的那个文件。
 - 没有丢东西、但要理由行的改动：
   - 测试文件里，两边改了同一条断言，解决冲突时取一边：不论取哪一边（`--ours`、`--theirs` 或手改），被舍弃的那条都由 `assertion-loss`
