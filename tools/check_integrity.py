@@ -66,7 +66,7 @@ from typing import NamedTuple
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 PROG = "check-integrity"
 DEFAULT_RULES = Path(__file__).resolve().with_name("check_integrity_rules.json")
-KINDS = frozenset({"added", "net-added", "removed", "net-loss", "deleted", "changed"})
+KINDS = frozenset({"added", "added-after", "net-added", "removed", "net-loss", "deleted", "changed"})
 LINELESS_KINDS = frozenset({"deleted", "changed"})  # judged by the file, not by its lines
 RULE_KEYS = frozenset(
     {
@@ -75,6 +75,7 @@ RULE_KEYS = frozenset(
         "classes",
         "why",
         "patterns",
+        "after",
         "allow",
         "skip_lines",
         "existing_only",
@@ -122,6 +123,8 @@ CONJUNCTION = re.compile(r"&&|\band\b")
 # version number (digits and dots, optionally led by v); both are replaced before two lines are compared.
 HEX_DIGEST = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{64}|[0-9A-Fa-f]{40})(?![0-9A-Fa-f])")
 VERSION_NUMBER = re.compile(r"(?<![\w.])v?\d+(?:\.\d+)*(?!\w)")
+# A line a rule that looks at the line above a change steps over.
+BLANK_OR_COMMENT = re.compile(r"^\s*(?:$|#|//|/\*|\*)")
 MARKER_END = re.compile(r"\s--\s|\*/|(?<=.)#")
 # A test file and the source it tests, by file name: test_x.py or x_test.py is x.py,
 # x_test.go is x.go, x.test.ts or x.spec.ts is x plus any JavaScript or TypeScript suffix.
@@ -159,6 +162,7 @@ class Rule:
     spare_with_source: bool = False
     severity: str = BLOCK
     exempt_paths: tuple[str, ...] = ()
+    after: tuple[re.Pattern[str], ...] = ()
 
     def exempts(self, diff: FileDiff) -> bool:
         """True if the overlay exempts this file from the rule. A renamed file needs both its
@@ -251,6 +255,11 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
     severity = raw.get("severity", BLOCK)
     if severity not in SEVERITIES:
         raise IntegrityError(f"{where}: severity must be one of {sorted(SEVERITIES)}")
+    after = compile_list(raw.get("after", []), f"{where} after")
+    if raw["kind"] == "added-after" and not after:
+        raise IntegrityError(f"{where}: kind added-after needs a non-empty after list")
+    if after and raw["kind"] != "added-after":
+        raise IntegrityError(f"{where}: after works only with kind added-after")
     return Rule(
         raw["id"],
         raw["kind"],
@@ -261,6 +270,7 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
         compile_list(raw.get("skip_lines", []), f"{where} skip_lines"),
         **flags,
         severity=severity,
+        after=after,
     )
 
 
@@ -392,11 +402,15 @@ def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
 
 class Line(NamedTuple):
     """One added or removed line; ``number`` is its place in the new file, ``hunk`` the
-    number of its hunk in the file's patch."""
+    number of its change in the file's patch (a run of changed lines with no unchanged line
+    between, as in a ``-U0`` patch). ``before`` is the nearest line above an added line, in
+    the new file, that is neither blank nor a whole-line comment; None when the patch shows
+    none, and for a removed line."""
 
     number: int
     text: str
     hunk: int = 0
+    before: str | None = None
 
 
 @dataclass
@@ -430,7 +444,9 @@ def decode(raw: bytes) -> str:
 def parse_patch(
     path: str, patch: bytes, deleted: bool = False, status: str | None = None, old_path: str | None = None
 ) -> FileDiff:
-    """Parse a ``-U0`` patch of a single file. Hunk lengths decide what is content."""
+    """Parse the patch of a single file, with context lines or without (``-U0``). Hunk lengths
+    decide what is content. ``Line.hunk`` counts runs of changed lines, so it is the same
+    whatever the context; each added line also records the line above it (``Line.before``)."""
     diff = FileDiff(path, status or ("D" if deleted else "M"), old_path)
     lines = patch.split(b"\n")
     if lines and lines[-1] == b"":
@@ -455,7 +471,8 @@ def parse_patch(
         if new_line < 1:
             new_line = 1
         index += 1
-        hunk += 1
+        in_run = False
+        before = None  # the nearest new-side line above that is not blank or a comment
         while old_left or new_left:
             if index >= len(lines):
                 raise IntegrityError(f"cannot parse diff of {path}: hunk ends early")
@@ -464,14 +481,22 @@ def parse_patch(
             if raw.startswith(b"\\"):
                 continue  # "\ No newline at end of file"
             tag, text = raw[:1], decode(raw[1:])
+            if tag in (b"+", b"-") and not in_run:
+                hunk += 1
+                in_run = True
             if tag == b"+" and new_left:
-                diff.added.append(Line(new_line, text, hunk))
+                diff.added.append(Line(new_line, text, hunk, before))
+                if not BLANK_OR_COMMENT.match(text):
+                    before = text
                 new_line += 1
                 new_left -= 1
             elif tag == b"-" and old_left:
                 diff.removed.append(Line(new_line, text, hunk))
                 old_left -= 1
             elif tag == b" " and old_left and new_left:
+                in_run = False
+                if not BLANK_OR_COMMENT.match(text):
+                    before = text
                 new_line += 1
                 old_left -= 1
                 new_left -= 1
@@ -544,6 +569,7 @@ def git(args: list[str]) -> bytes:
 # changes made on top of the move, not as a deletion plus an addition. ``--text`` makes git
 # print a patch for a file its attributes (``-diff``, a driver with ``binary``) or its content
 # call binary, so a repository's attributes cannot hide lines from the scan.
+CONTEXT_LINES = 3  # unchanged lines around a change: what a rule that reads the line above a change sees
 DIFF_FLAGS = [
     "--find-renames",
     "--no-color",
@@ -616,7 +642,7 @@ def read_change(command: list[str], base: list[str], change: Change, merge: bool
     if status == "T":
         return FileDiff(path, "D", typechange=True)
     spec = pathspecs([old_path, path] if old_path else [path], names)
-    patch = git([*command, "-p", "-U0", *DIFF_FLAGS, *base, "--", *spec])
+    patch = git([*command, "-p", f"-U{CONTEXT_LINES}", *DIFF_FLAGS, *base, "--", *spec])
     sections = sum(1 for line in patch.split(b"\n") if line.startswith(b"diff --git "))
     if sections != 1:
         return FileDiff(path, status, old_path, unreadable=f"git gave {sections} file patches for this one file")
@@ -1030,6 +1056,12 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
             continue
         if rule.kind == "added":
             hits += [Hit(diff.path, l.number, rule.id, l.text) for l in diff.added if rule.matches(l.text)]
+        elif rule.kind == "added-after":
+            hits += [
+                Hit(diff.path, l.number, rule.id, l.text)
+                for l in diff.added
+                if l.before is not None and rule.matches(l.text) and any(a.search(l.before) for a in rule.after)
+            ]
         elif rule.kind == "net-added":
             hits += net_added_hits(diff, rule)
         else:  # removed

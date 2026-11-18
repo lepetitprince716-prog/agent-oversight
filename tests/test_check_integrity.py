@@ -386,6 +386,120 @@ class ShortCircuitedTest(RepoCase):
         code, out, _ = self.repo.scan("--commit", "HEAD")
         self.assertEqual(code, 0, out)
 
+    HELPERS = (
+        "\n\nclass Fake:\n"
+        "    def close(self):\n"
+        "        self.closed = True\n"
+        "\n\ndef wait_for(items):\n"
+        "    for item in items:\n"
+        "        if item:\n"
+        "            break\n"
+    )
+    VALUE_TEST = BASE_TEST.replace("        assert 2 == 2\n", "        value = f()\n        assert 2 == 2\n")
+    JS_HELPER = "function wait(done) {\n  if (done) {\n    use();\n  }\n}\n"
+
+    def test_a_return_that_is_not_the_first_statement_of_a_test_is_green(self):
+        cases = {
+            "in the loop of a helper": ("tests/test_a.py", BASE_TEST + self.HELPERS, "            break\n", "            return\n"),
+            "first statement of a helper that is no test": (
+                "tests/test_a.py",
+                BASE_TEST + self.HELPERS,
+                "    def close(self):\n",
+                "    def close(self):\n        return None\n",
+            ),
+            "in the middle of a test": (
+                "tests/test_a.py",
+                self.VALUE_TEST,
+                "        value = f()\n",
+                "        value = f()\n        if value is None:\n            return\n",
+            ),
+            "js helper": ("web/a.test.ts", self.JS_HELPER, "    use();\n", "    use();\n    return;\n"),
+        }
+        for name, (path, base, anchor, line) in cases.items():
+            with self.subTest(name):
+                self.repo.commit(**{path.replace("/", "__"): base})
+                self.repo.commit(**{path.replace("/", "__"): base.replace(anchor, line, 1)})
+                self.assertEqual(self.rules_at_head(), set())
+
+    def test_a_return_as_the_first_statement_is_red_in_each_form_of_a_test_definition(self):
+        cases = {
+            "async python test with a return type": (
+                "tests/test_a.py",
+                BASE_TEST.replace("    def test_one(self):", "    async def test_one(self) -> None:"),
+                "    async def test_one(self) -> None:\n",
+                "        return\n",
+                5,
+            ),
+            "js it.only": ("web/a.test.ts", "it.only('one', () => {\n  expect(f()).toBe(1)\n})\n", "it.only('one', () => {\n", "  return\n", 2),
+            "js test with an async callback": ("web/a.test.ts", "test('one', async () => {\n  expect(f()).toBe(1)\n})\n", "test('one', async () => {\n", "  return;\n", 2),
+            "rust async function": ("crate/tests/a.rs", "pub async fn a() {\n    check().await;\n}\n", "pub async fn a() {\n", "    return;\n", 2),
+        }
+        for name, (path, base, anchor, line, number) in cases.items():
+            with self.subTest(name):
+                self.commit_edit(path, base, anchor, line)
+                self.assertEqual(self.rules_at_head(), {(path, number, SHORT_CIRCUIT_RULE, False)})
+
+    def test_a_new_test_file_is_judged_too(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(tests__test_new_py="def test_x():\n    return\n")
+        self.assertEqual(self.rules_at_head(), {("tests/test_new.py", 2, SHORT_CIRCUIT_RULE, False)})
+
+    def test_blank_and_comment_lines_between_the_definition_and_the_return_do_not_hide_it(self):
+        self.commit_edit("tests/test_a.py", BASE_TEST, "    def test_one(self):\n", "        # parked\n\n        return\n")
+        self.assertEqual(self.rules_at_head(), {("tests/test_a.py", 7, SHORT_CIRCUIT_RULE, False)})
+
+    def test_a_return_that_moves_from_one_test_to_another_is_still_red(self):
+        first = "    def test_one(self):\n"
+        second = "    def test_two(self):\n"
+        self.repo.commit(tests__test_a_py=BASE_TEST.replace(first, first + "        return\n"))
+        self.repo.commit(tests__test_a_py=BASE_TEST.replace(second, second + "        return\n"))
+        self.assertEqual(self.rules_at_head(), {("tests/test_a.py", 8, SHORT_CIRCUIT_RULE, False)})
+
+    def test_a_return_that_was_there_already_is_not_reported_when_a_line_next_to_it_changes(self):
+        parked = BASE_TEST.replace("    def test_one(self):\n", "    def test_one(self):\n        return\n")
+        self.repo.commit(tests__test_a_py=parked)
+        self.repo.commit(tests__test_a_py=parked.replace("assertEqual(f(), 1)", "assertEqual(f(), 2)"))
+        self.assertNotIn(SHORT_CIRCUIT_RULE, self.rule_names())
+
+    def test_a_definition_that_the_patch_does_not_show_is_not_seen(self):
+        comments = "        # a\n        # b\n        # c\n        # d\n"
+        base = BASE_TEST.replace("        self.assertEqual(f(), 1)\n", comments + "        self.assertEqual(f(), 1)\n")
+        self.repo.commit(tests__test_a_py=base)
+        self.repo.commit(tests__test_a_py=base.replace("        # d\n", "        # d\n        return\n"))
+        self.assertNotIn(SHORT_CIRCUIT_RULE, self.rule_names())
+
+    def rules_changed(self, **changes):
+        document = json.loads(RULES.read_text())
+        rule = next(r for r in document["rules"] if r["id"] == SHORT_CIRCUIT_RULE)
+        for key, value in changes.items():
+            if value is None:
+                rule.pop(key, None)
+            else:
+                rule[key] = value
+        path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-short-rules.json"
+        path.write_text(json.dumps(document))
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_the_after_list_is_checked_when_the_table_is_loaded(self):
+        self.repo.commit(README_md="seed\n")
+        cases = {
+            "no after list": ({"after": None}, "needs a non-empty after list"),
+            "an empty after list": ({"after": []}, "needs a non-empty after list"),
+            "after is not a list": ({"after": "def test"}, "list of non-empty strings"),
+            "after holds an empty string": ({"after": [""]}, "list of non-empty strings"),
+            "after holds a number": ({"after": [3]}, "list of non-empty strings"),
+            "after does not compile": ({"after": ["("]}, "invalid pattern"),
+            "an after list on another kind": ({"kind": "net-added"}, "after works only with kind added-after"),
+            "a field no rule has": ({"afters": ["x"]}, "may add"),
+            "a pattern that does not compile": ({"patterns": ["("]}, "invalid pattern"),
+        }
+        for name, (changes, message) in cases.items():
+            with self.subTest(name):
+                code, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(self.rules_changed(**changes)))
+                self.assertEqual(code, 2, out + err)
+                self.assertIn(message, err)
+
 
 DETACHABLE = (
     "import unittest\n"
@@ -465,6 +579,27 @@ class TautologyAdded(RepoCase):
         "js expect same string": ("web/a.test.ts", "  expect('a').toEqual('a')\n"),
         "rust assert true": ("crate/tests/a.rs", "    assert!(true);\n"),
         "rust assert true with a message": ("crate/tests/a.rs", "    assert!(true, \"ok\");\n"),
+        "assertEqual of one call": ("tests/test_a.py", "        self.assertEqual(f(), f())\n"),
+        "assertEqual of one call with arguments": ("tests/test_a.py", "        self.assertEqual(f(1, 'a'), f(1, 'a'), 'same')\n"),
+        "assertIs of one attribute chain": ("tests/test_a.py", "        self.assertIs(a.b, a.b)\n"),
+        "assertIs of one qualified name": ("tests/test_a.py", "        self.assertEqual(mod.Kind.X, mod.Kind.X)\n"),
+        "assert of one name": ("tests/test_a.py", "        assert x == x\n"),
+        "assert of one number": ("tests/test_a.py", "        assert 1 == 1\n"),
+        "assert of one call with a message": ("tests/test_a.py", "        assert f() == f(), 'same'\n"),
+        "assertIsNone of None": ("tests/test_a.py", "        self.assertIsNone(None)\n"),
+        "assertIsNotNone of a number": ("tests/test_a.py", "        self.assertIsNotNone(5)\n"),
+        "assertIsNotNone of a string": ("tests/test_a.py", "        self.assertIsNotNone('a')\n"),
+        "assertIsNotNone of True": ("tests/test_a.py", "        self.assertIsNotNone(True, 'set')\n"),
+        "assertTrue of a number": ("tests/test_a.py", "        self.assertTrue(1)\n"),
+        "assertTrue of a decimal": ("tests/test_a.py", "        self.assertTrue(0.5)\n"),
+        "assertTrue of a string": ("tests/test_a.py", "        self.assertTrue('ok', 'fine')\n"),
+        "assert of a number": ("tests/test_a.py", "        assert 1\n"),
+        "assert of a string with a message": ("tests/test_a.py", "        assert 'ok', 'fine'\n"),
+        "js expect of one call": ("web/a.test.ts", "  expect(f()).toBe(f())\n"),
+        "js expect of one name": ("web/a.test.ts", "  expect(value).toEqual(value)\n"),
+        "rust assert_eq of one name": ("crate/tests/a.rs", "    assert_eq!(x, x);\n"),
+        "rust assert_eq of one call with a message": ("crate/tests/a.rs", "    assert_eq!(f(), f(), \"same\");\n"),
+        "rust debug_assert_eq of one field": ("crate/tests/a.rs", "    debug_assert_eq!(s.a, s.a);\n"),
     }
     GREEN = {
         "assertTrue of a value": "        self.assertTrue(flag)\n",
@@ -476,6 +611,30 @@ class TautologyAdded(RepoCase):
         "assertIs of None and a value": "        self.assertIs(found, None)\n",
         "assert of a comparison": "        assert x == x2\n",
         "assert of a name starting with True": "        assert Truthy\n",
+        "assertEqual of a name and a near name": "        self.assertEqual(a, a2)\n",
+        "assertEqual of two calls": "        self.assertEqual(f(1), f(2))\n",
+        "assertEqual of an attribute and its owner": "        self.assertEqual(a.b, a)\n",
+        "assertEqual of a name and an item of it": "        self.assertEqual(x, x[0])\n",
+        "assert of two names": "        assert x == y\n",
+        "assert of a name and an item of it": "        assert x == x[0]\n",
+        "assert of a comparison with a call": "        assert x == x.y()\n",
+        "assert of equal names joined to another test": "        assert x == x and y\n",
+        "assertTrue of a name": "        self.assertTrue(value)\n",
+        "assertTrue of zero": "        self.assertTrue(0)\n",
+        "assertTrue of a comparison with a number": "        self.assertTrue(1 == x)\n",
+        "assertTrue of an empty string": "        self.assertTrue('')\n",
+        "assertIsNone of a name": "        self.assertIsNone(result)\n",
+        "assertIsNotNone of a name": "        self.assertIsNotNone(result)\n",
+        "assertIsNotNone of None": "        self.assertIsNotNone(None)\n",
+        "assert of a name": "        assert value\n",
+        "assert of zero": "        assert 0\n",
+        "assert of an empty string": "        assert ''\n",
+    }
+    GREEN_OTHER_LANGUAGES = {
+        "js expect of a call and another call": ("web/a.test.ts", "  expect(f(1)).toBe(f(2))\n"),
+        "js expect of a name and its item": ("web/a.test.ts", "  expect(x).toBe(x[0])\n"),
+        "rust assert_eq of a name and a near name": ("crate/tests/a.rs", "    assert_eq!(x, x2);\n"),
+        "rust assert_eq of two calls": ("crate/tests/a.rs", "    assert_eq!(f(1), f(2));\n"),
     }
     HOST = {
         "tests/test_a.py": (BASE_TEST, "    def test_one(self):\n"),
@@ -500,6 +659,12 @@ class TautologyAdded(RepoCase):
         for name, line in self.GREEN.items():
             with self.subTest(name):
                 self.add("tests/test_a.py", line)
+                self.assertEqual(self.rules_at_head(), set())
+
+    def test_assertions_of_other_languages_that_can_fail_are_green(self):
+        for name, (path, line) in self.GREEN_OTHER_LANGUAGES.items():
+            with self.subTest(name):
+                self.add(path, line)
                 self.assertEqual(self.rules_at_head(), set())
 
     def test_a_real_assertion_swapped_for_one_that_cannot_fail_is_red(self):
@@ -729,6 +894,30 @@ class DiffEdgeCases(RepoCase):
                 with self.assertRaises(ci.IntegrityError):
                     ci.parse_patch("x", patch, deleted=False)
 
+    # The two patches below are of one change, as git prints them for -U0 and -U3.
+    WITH_CONTEXT = (
+        b"@@ -1,4 +1,5 @@\n def test_a():\n+    return\n     x = 1\n-    y = 2\n+    y = 3\n     z = 4\n"
+    )
+    WITHOUT_CONTEXT = b"@@ -1,0 +2 @@\n+    return\n@@ -3 +4 @@\n-    y = 2\n+    y = 3\n"
+
+    def test_the_context_of_a_patch_changes_neither_line_numbers_nor_hunks(self):
+        shape = lambda diff: (
+            [(l.number, l.text, l.hunk) for l in diff.added],
+            [(l.number, l.text, l.hunk) for l in diff.removed],
+        )
+        with_context = ci.parse_patch("x", self.WITH_CONTEXT)
+        self.assertEqual(shape(with_context), shape(ci.parse_patch("x", self.WITHOUT_CONTEXT)))
+        self.assertEqual(shape(with_context), ([(2, "    return", 1), (4, "    y = 3", 2)], [(4, "    y = 2", 2)]))
+
+    def test_an_added_line_knows_the_line_above_it_that_is_not_blank_or_a_comment(self):
+        patch = (
+            b"@@ -1,4 +1,7 @@\n def test_a():\n     # why\n+\n+    # more\n+    return\n     x = 1\n     y = 2\n"
+        )
+        before = lambda diff: [l.before for l in diff.added]
+        self.assertEqual(before(ci.parse_patch("x", patch)), ["def test_a():"] * 3)
+        self.assertEqual(before(ci.parse_patch("x", self.WITH_CONTEXT)), ["def test_a():", "    x = 1"])
+        self.assertEqual(before(ci.parse_patch("x", self.WITHOUT_CONTEXT)), [None, None])
+
 
 def skipped(text, name="test_one"):
     return text.replace(f"    def {name}", f"    @unittest.skip('x')\n    def {name}")
@@ -854,7 +1043,7 @@ class MergeCommits(RepoCase):
         self.assertEqual(code, 2, out)
         self.assertIn("--remerge-diff", err)
         self.assertIn("2.36", err)
-        code, _, _ = self.repo.scan("--commit", "HEAD~1")
+        code, _, _ = self.repo.scan("--commit", "HEAD^2")  # the side commit: one parent
         self.assertEqual(code, 0, "a commit with one parent needs no remerge-diff")
 
 
