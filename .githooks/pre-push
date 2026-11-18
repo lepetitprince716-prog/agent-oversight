@@ -1,4 +1,9 @@
 #!/bin/sh
 set -eu
 cd "$(git rev-parse --show-toplevel)"
-exec python3 tools/privacy_scan.py --history
+# git gives the refs being pushed on standard input; keep them for the second check.
+refs=$(cat)
+status=0
+python3 tools/privacy_scan.py --history || status=1
+printf '%s\n' "$refs" | python3 tools/check_integrity.py --pre-push || status=1
+exit "$status"

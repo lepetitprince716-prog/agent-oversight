@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'net-added' likewise, but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change. An id may appear in several entries.",
+  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'net-added' likewise, but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change. severity: 'block' (the default) needs a Check-change line in the commit message; 'note' is printed and counted but never fails the run. An id may appear in several entries; they share one severity. A repository adjusts severity and appends allow-regexes per rule id in its own .check-integrity.json.",
   "classes": {
     "test": [
       "(^|/)tests?/",
@@ -62,6 +62,7 @@
       "(^|/)\\.markdownlint(-cli2)?\\.(jsonc?|ya?ml)$",
       "(^|/)tools/check_integrity\\.py$",
       "(^|/)tools/check_integrity_rules\\.json$",
+      "(^|/)\\.check-integrity\\.json$",
       "(^|/)tools/privacy_scan\\.py$",
       "(^|/)tools/privacy_rules\\.json$"
     ],
@@ -104,6 +105,7 @@
         "source"
       ],
       "why": "a checker is told to look away (net new markers per file)",
+      "severity": "note",
       "patterns": [
         "#\\s*type:\\s*ignore\\b",
         "#\\s*noqa\\b",

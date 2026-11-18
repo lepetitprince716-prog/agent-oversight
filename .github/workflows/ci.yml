@@ -38,3 +38,50 @@ jobs:
             rules="$RUNNER_TEMP/privacy_rules.json"
           fi
           python3 -B "$scanner" --rules "$rules" --tracked --history
+      - name: Check-integrity scan of the commits being added
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          scanner=tools/check_integrity.py
+          rules=tools/check_integrity_rules.json
+          overlay=""
+          if [ -n "$BASE_REF" ]; then
+            if git cat-file -e "origin/$BASE_REF:tools/check_integrity.py" 2>/dev/null; then
+              # As with the privacy scan: on a pull request the scanner, its rules and the
+              # repository's .check-integrity.json come from the base branch, so a change
+              # cannot loosen the checks it is judged by.
+              git show "origin/$BASE_REF:tools/check_integrity.py" > "$RUNNER_TEMP/check_integrity.py"
+              git show "origin/$BASE_REF:tools/check_integrity_rules.json" > "$RUNNER_TEMP/check_integrity_rules.json"
+              scanner="$RUNNER_TEMP/check_integrity.py"
+              rules="$RUNNER_TEMP/check_integrity_rules.json"
+              if ! grep -q -- '--no-overlay' "$scanner"; then
+                :  # an older scanner on the base branch knows no overlay file
+              elif git cat-file -e "origin/$BASE_REF:.check-integrity.json" 2>/dev/null; then
+                git show "origin/$BASE_REF:.check-integrity.json" > "$RUNNER_TEMP/check-integrity-overlay.json"
+                overlay="--overlay $RUNNER_TEMP/check-integrity-overlay.json"
+              else
+                overlay="--no-overlay"
+              fi
+            fi
+            # Otherwise the base branch has no scanner yet: this is the pull request that
+            # first adds it, so it is judged by its own copy. Read it before merging.
+            # The head commit of the pull request, not the merge commit CI checks out: the
+            # merge commit has no Check-change line and would be judged as a whole.
+            python3 -B "$scanner" --rules "$rules" $overlay --range "origin/$BASE_REF..$PR_HEAD"
+          else
+            case "$BEFORE" in
+              *[!0]*) first=no ;;
+              *) first=yes ;;
+            esac
+            if [ "$first" = no ] && ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              first=yes # a force push: the old tip is not in this clone
+            fi
+            if [ "$first" = yes ]; then
+              python3 -B "$scanner" --rules "$rules" --commit "$AFTER"
+            else
+              python3 -B "$scanner" --rules "$rules" --range "$BEFORE..$AFTER"
+            fi
+          fi

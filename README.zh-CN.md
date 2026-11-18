@@ -63,6 +63,65 @@ PR 写成 `PR #12`、`owner/name#12` 或 PR 链接时会被查到。最后两项
 1 表示有，2 表示工具没能完成检查：配置或任务库读不了，或者工具自己出错（traceback 在标准错误里）。输出固定
 是 UTF-8。
 
+## 提交检查
+
+`tools/check_integrity.py` 读提交，找出削弱检查而不是通过检查的改动：跳过或删除测试、去掉断言、压掉
+linter 或类型检查、绕过钩子或 CI 步骤、从检查配置里删行。它是一个文件加一份规则表，只用标准库。
+
+被报的提交，提交说明里有一行顶格的 `Check-change: <理由>`，理由不少于 20 个字符，就能通过；一行
+管该提交的全部发现。只认提交说明：写在代码旁边的理由不算。
+
+每条规则有一个级别。`block` 是默认级别，要有这一行，否则退出码为 1。`note` 照常打印并计数，不影响退出码，
+也不需要这一行。自带规则里只有 `suppression-added`（新增 `# noqa`、`# type: ignore`、`eslint-disable`
+这类压制标记）是 `note`：这类标记多半是局部判断，每个都要理由，理由行就成了例行公事。
+
+```bash
+python3 tools/check_integrity.py --staged --message-file .git/COMMIT_EDITMSG   # commit-msg 钩子跑的
+python3 tools/check_integrity.py --commit HEAD                                 # 一个提交
+python3 tools/check_integrity.py --range origin/main..HEAD                     # 一个范围里的每个提交
+python3 tools/check_integrity.py --pre-push < refs                             # git 给 pre-push 钩子的那几行
+```
+
+退出码 0 表示没有需要理由的发现，或都有理由；1 表示有没理由的 `block` 发现；2 表示工具没能完成检查（规则表读
+不了、git 调用失败、diff 解析不了），不会默认放行。`--json` 给程序看，每条发现带级别。
+
+### 单个仓库调整规则
+
+仓库顶层的 `.check-integrity.json` 叠加在规则表上。它只能按规则 id 设 `severity` 和追加 `allow` 正则，别的
+键或规则表里没有的 id 都是错误（退出码 2）。`allow` 正则从每处匹配的起点试起，对规则覆盖的所有文件生效。
+
+```json
+{
+  "version": 1,
+  "rules": {
+    "skip-added": { "severity": "note" },
+    "bypass-added": { "allow": ["\\|\\|\\s*true\\b.*# best effort"] }
+  }
+}
+```
+
+这个文件本身算检查文件：从里面删行，和其他削弱检查的改动一样要 `Check-change:` 行。`--overlay PATH` 读另一个文件，
+`--no-overlay` 不读。
+
+本仓库自己的文件放行扫描器测试里当作数据的标记字符串：`skip-added` 命中的那一行同时含字面的 `\n`，或者紧跟在扫描器
+自己的输出文字后面。改这些字符串不要理由行；删测试或删断言照样要。
+
+### 在别的仓库里用
+
+复制 `tools/check_integrity.py` 和 `tools/check_integrity_rules.json`，在仓库自己的钩子里调用。本仓库
+`.githooks/commit-msg` 和 `.githooks/pre-push` 展示了怎么和别的检查一起跑，任何一个失败都拒绝。
+
+```sh
+#!/bin/sh
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+python3 tools/check_integrity.py --staged --message-file "$1"
+```
+
+pre-push 钩子把 git 给的标准输入接到 `--pre-push`；新分支扫的是没有任何远端分支持有的提交。
+[.github/workflows/ci.yml](.github/workflows/ci.yml) 对每次推送和拉取请求跑同样的扫描，拉取请求上扫描器、
+规则表和 `.check-integrity.json` 取自 base 分支。
+
 ## 模板
 
 - [templates/handoff.zh-CN.md](templates/handoff.zh-CN.md)：交接文件（中文），写法规则见

@@ -5,10 +5,13 @@ It reads git diffs and commit messages and reports changes that skip or delete t
 drop assertions, silence linters and type checkers, bypass hooks or CI, or remove lines
 from check configuration. Such a change is allowed only when its commit message carries
 a top-level line ``Check-change: <reason of 20 or more characters>``; one line covers
-every finding of that commit. The rules live in ``check_integrity_rules.json``.
+every finding of that commit. The rules live in ``check_integrity_rules.json``. A rule has
+a severity: ``block`` (the default) needs that line, ``note`` is printed and counted but
+never fails the run. A repository can adjust severities and add ``allow`` patterns in its own
+``.check-integrity.json`` (see ``load_overlay``).
 
-Exit status: 0 no findings or every finding justified, 1 an unjustified finding, 2 usage
-or git error. The guard fails closed: an unreadable rules file, a failed git call or a
+Exit status: 0 no blocking finding, or every one justified; 1 an unjustified blocking
+finding; 2 usage or git error. The guard fails closed: an unreadable rules file, a failed git call or a
 diff it cannot parse is an error, never a pass. Standard library only; one file, so it
 can be copied into another repository together with its rules file.
 """
@@ -22,7 +25,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -31,9 +34,25 @@ PROG = "check-integrity"
 DEFAULT_RULES = Path(__file__).resolve().with_name("check_integrity_rules.json")
 KINDS = frozenset({"added", "net-added", "removed", "net-loss", "deleted"})
 RULE_KEYS = frozenset(
-    {"id", "kind", "classes", "why", "patterns", "allow", "skip_lines", "existing_only", "spare_with_source"}
+    {
+        "id",
+        "kind",
+        "classes",
+        "why",
+        "patterns",
+        "allow",
+        "skip_lines",
+        "existing_only",
+        "spare_with_source",
+        "severity",
+    }
 )
 DOCUMENT_KEYS = frozenset({"version", "note", "classes", "rules"})
+BLOCK, NOTE = "block", "note"
+SEVERITIES = frozenset({BLOCK, NOTE})
+OVERLAY_NAME = ".check-integrity.json"
+OVERLAY_KEYS = frozenset({"version", "rules"})
+OVERLAY_RULE_KEYS = frozenset({"severity", "allow"})
 
 JUSTIFICATION = re.compile(r"Check-change:(.*)")
 MIN_REASON = 20
@@ -74,6 +93,7 @@ class Rule:
     skip_lines: tuple[re.Pattern[str], ...]
     existing_only: bool = False
     spare_with_source: bool = False
+    severity: str = BLOCK
 
     def skips(self, line: str) -> bool:
         return any(skip.search(line) for skip in self.skip_lines)
@@ -102,6 +122,10 @@ class Rule:
 class RuleSet:
     classes: dict[str, tuple[re.Pattern[str], ...]]
     rules: tuple[Rule, ...]
+
+    def severity_of(self, rule_id: str) -> str:
+        """The severity of a rule id; load_rules makes every entry of one id agree."""
+        return next((rule.severity for rule in self.rules if rule.id == rule_id), BLOCK)
 
     def classes_of(self, path: str) -> frozenset[str]:
         return frozenset(
@@ -139,6 +163,9 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
         raise IntegrityError(f"{where}: existing_only and spare_with_source must be true or false")
     if flags["spare_with_source"] and raw["kind"] != "deleted":
         raise IntegrityError(f"{where}: spare_with_source works only with kind deleted")
+    severity = raw.get("severity", BLOCK)
+    if severity not in SEVERITIES:
+        raise IntegrityError(f"{where}: severity must be one of {sorted(SEVERITIES)}")
     return Rule(
         raw["id"],
         raw["kind"],
@@ -148,6 +175,7 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
         compile_list(raw.get("allow", []), f"{where} allow"),
         compile_list(raw.get("skip_lines", []), f"{where} skip_lines"),
         **flags,
+        severity=severity,
     )
 
 
@@ -171,7 +199,64 @@ def load_rules(path: Path) -> RuleSet:
         compile_rule(raw, f"{path}: rules entry {number}", set(classes))
         for number, raw in enumerate(raw_rules, start=1)
     )
+    levels: dict[str, str] = {}
+    for rule in rules:
+        if levels.setdefault(rule.id, rule.severity) != rule.severity:
+            raise IntegrityError(f"{path}: entries of rule {rule.id} must share one severity")
     return RuleSet(classes, rules)
+
+
+def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
+    """Apply a repository's own ``.check-integrity.json`` to the rules. The file is
+    ``{"version": 1, "rules": {"<rule id>": {"severity": "note", "allow": ["<regex>"]}}}``:
+    per rule id it may set the severity and append allow-regexes, and nothing else. Any other
+    key, or an id the rules do not have, is an error, so the file cannot quietly change more
+    than that."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise IntegrityError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(document, dict) or document.get("version", 1) != 1:
+        raise IntegrityError(f'{path}: expected a JSON object; "version", when present, must be 1')
+    unknown = sorted(set(document) - OVERLAY_KEYS)
+    if unknown:
+        raise IntegrityError(f"{path}: unknown key(s): {', '.join(unknown)}")
+    changes = document.get("rules", {})
+    if not isinstance(changes, dict):
+        raise IntegrityError(f"{path}: 'rules' must be an object keyed by rule id")
+    known = {rule.id for rule in rules.rules}
+    allow: dict[str, tuple[re.Pattern[str], ...]] = {}
+    severity: dict[str, str] = {}
+    for rule_id, change in changes.items():
+        where = f"{path}: rule {rule_id}"
+        if rule_id not in known:
+            raise IntegrityError(f"{where}: no such rule (known: {', '.join(sorted(known))})")
+        if not isinstance(change, dict) or set(change) - OVERLAY_RULE_KEYS:
+            raise IntegrityError(f"{where}: only {sorted(OVERLAY_RULE_KEYS)} may be set")
+        if "severity" in change:
+            if change["severity"] not in SEVERITIES:
+                raise IntegrityError(f"{where}: severity must be one of {sorted(SEVERITIES)}")
+            severity[rule_id] = change["severity"]
+        if "allow" in change:
+            allow[rule_id] = compile_list(change["allow"], f"{where} allow")
+    return RuleSet(
+        rules.classes,
+        tuple(
+            replace(
+                rule,
+                severity=severity.get(rule.id, rule.severity),
+                allow=rule.allow + allow.get(rule.id, ()),
+            )
+            for rule in rules.rules
+        ),
+    )
+
+
+def repository_overlay() -> Path | None:
+    """The overlay file at the top of the repository the command runs in, if there is one."""
+    top = Path(os.fsdecode(git(["rev-parse", "--show-toplevel"]).rstrip(b"\n")))
+    path = top / OVERLAY_NAME
+    return path if path.is_file() else None
 
 
 # --- diff parsing --------------------------------------------------------------------
@@ -360,6 +445,42 @@ def range_commits(spec: str) -> list[str]:
     return git(["rev-list", "--reverse", spec, "--"]).decode().split()
 
 
+OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def has_commit(oid: str) -> bool:
+    try:
+        done = subprocess.run(["git", "cat-file", "-e", f"{oid}^{{commit}}"], capture_output=True, check=False)
+    except OSError as exc:
+        raise IntegrityError(f"cannot run git: {exc}") from exc
+    return done.returncode == 0
+
+
+def push_commits(refs: str) -> list[str]:
+    """The commits a push brings, oldest first, from the lines git gives a pre-push hook:
+    ``<local ref> <local sha> <remote ref> <remote sha>``. A deleted branch (local sha all
+    zeros) brings none. A new branch (remote sha all zeros), or one whose remote sha this
+    clone does not have, brings the commits of the local sha that no remote-tracking branch
+    holds. Any other ref brings ``remote sha..local sha``."""
+    seen: dict[str, None] = {}
+    for line in refs.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 4 or not all(OBJECT_ID.fullmatch(p) or set(p) == {"0"} for p in parts[1::2]):
+            raise IntegrityError(f"unexpected line from git for a pre-push hook: {line[:80]!r}")
+        local, remote = parts[1], parts[3]
+        if set(local) == {"0"}:
+            continue
+        if set(remote) == {"0"} or not has_commit(remote):
+            spec = [local, "--not", "--remotes"]
+        else:
+            spec = [f"{remote}..{local}"]
+        for oid in git(["rev-list", "--reverse", *spec, "--"]).decode().split():
+            seen.setdefault(oid)
+    return list(seen)
+
+
 # --- judging -------------------------------------------------------------------------
 
 
@@ -370,11 +491,16 @@ class Finding(NamedTuple):
     rule: str
     text: str
     justified: bool
+    severity: str = BLOCK
+
+    @property
+    def blocking(self) -> bool:
+        return self.severity == BLOCK and not self.justified
 
     def __str__(self) -> str:
         path = CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", self.path)
         text = CONTROL_CHARS.sub(" ", self.text.strip())[:TEXT_WIDTH]
-        mark = " justified" if self.justified else ""
+        mark = " note" if self.severity == NOTE else " justified" if self.justified else ""
         return f"{self.where} {path}:{self.line} {self.rule}{mark}  {text}"
 
 
@@ -525,7 +651,7 @@ def justified(message: str) -> bool:
 
 def judge(where: str, diffs: list[FileDiff], message: str, rules: RuleSet) -> list[Finding]:
     ok = justified(message)
-    return [Finding(where, *hit, ok) for hit in judge_change(diffs, rules)]
+    return [Finding(where, *hit, ok, rules.severity_of(hit.rule)) for hit in judge_change(diffs, rules)]
 
 
 def read_message_file(path: Path | None) -> str:
@@ -544,13 +670,24 @@ class Report(NamedTuple):
     files: int
     staged: bool
 
+    @property
+    def blocking(self) -> int:
+        return sum(1 for f in self.findings if f.blocking)
+
+    @property
+    def notes(self) -> int:
+        return sum(1 for f in self.findings if f.severity == NOTE)
+
 
 def run(args: argparse.Namespace, rules: RuleSet) -> Report:
     if args.staged:
         diffs = collect(["--cached"])
         message = read_message_file(args.message_file)
         return Report(judge("staged", diffs, message, rules), 0, len(diffs), True)
-    commits = [resolve(args.commit)] if args.commit else range_commits(args.range)
+    if args.pre_push:
+        commits = push_commits(sys.stdin.read())
+    else:
+        commits = [resolve(args.commit)] if args.commit else range_commits(args.range)
     findings: list[Finding] = []
     files = 0
     for oid in commits:
@@ -568,18 +705,32 @@ def build_parser() -> argparse.ArgumentParser:
         prog="check_integrity.py",
         description="Report changes that weaken tests, linters, hooks or CI. A finding is "
         "allowed when the commit message has a top-level line "
-        f"'Check-change: <reason, {MIN_REASON}+ characters>'.",
-        epilog="exit status: 0 ok, 1 unjustified finding, 2 usage or git error",
+        f"'Check-change: <reason, {MIN_REASON}+ characters>'. Findings of a rule with severity "
+        "'note' are printed and counted but never fail the run.",
+        epilog="exit status: 0 ok, 1 unjustified blocking finding, 2 usage or git error",
         allow_abbrev=False,
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--staged", action="store_true", help="scan the staged diff")
     mode.add_argument("--commit", metavar="REV", help="scan one commit against its first parent")
     mode.add_argument("--range", metavar="A..B", help="scan each commit in the range")
+    mode.add_argument(
+        "--pre-push",
+        action="store_true",
+        help="scan the commits a push brings; reads git's pre-push lines from standard input",
+    )
     parser.add_argument(
         "--message-file", type=Path, metavar="PATH", help="with --staged: the commit message file"
     )
     parser.add_argument("--rules", type=Path, metavar="PATH", default=DEFAULT_RULES)
+    overlay = parser.add_mutually_exclusive_group()
+    overlay.add_argument(
+        "--overlay",
+        type=Path,
+        metavar="PATH",
+        help=f"apply this file instead of {OVERLAY_NAME} at the top of the repository",
+    )
+    overlay.add_argument("--no-overlay", action="store_true", help=f"ignore {OVERLAY_NAME}")
     parser.add_argument("--json", action="store_true", help="print a JSON report on stdout")
     return parser
 
@@ -592,28 +743,33 @@ def summary(report: Report) -> str:
 def print_text(report: Report) -> int:
     for finding in report.findings:
         print(finding)
-    open_count = sum(1 for f in report.findings if not f.justified)
-    if open_count:
+    notes = f" {report.notes} note(s) do not block." if report.notes else ""
+    if report.blocking:
         print(
-            f"{PROG}: {open_count} finding(s) without justification ({summary(report)}). If the "
+            f"{PROG}: {report.blocking} finding(s) without justification ({summary(report)}). If the "
             f"change is intended, add a top-level line 'Check-change: <why, {MIN_REASON}+ "
-            "characters>' to the commit message."
+            f"characters>' to the commit message.{notes}"
         )
         return EXIT_FINDINGS
-    if report.findings:
-        print(f"{PROG}: ok ({summary(report)}, {len(report.findings)} justified finding(s))")
-    else:
-        print(f"{PROG}: ok ({summary(report)})")
+    parts = [summary(report)]
+    justified_count = len(report.findings) - report.notes
+    if justified_count:
+        parts.append(f"{justified_count} justified finding(s)")
+    if report.notes:
+        parts.append(f"{report.notes} note(s), not blocking")
+    print(f"{PROG}: ok ({', '.join(parts)})")
     return EXIT_OK
 
 
 def print_json(report: Report) -> int:
-    code = EXIT_FINDINGS if any(not f.justified for f in report.findings) else EXIT_OK
+    code = EXIT_FINDINGS if report.blocking else EXIT_OK
     document = {
         "status": "findings" if code else "ok",
         "commits": report.commits,
         "staged": report.staged,
         "files": report.files,
+        "blocking": report.blocking,
+        "notes": report.notes,
         "findings": [f._asdict() for f in report.findings],
     }
     print(json.dumps(document, ensure_ascii=False, indent=2))
@@ -628,6 +784,9 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.reconfigure(errors="backslashreplace")
     try:
         rules = load_rules(args.rules)
+        overlay = None if args.no_overlay else args.overlay or repository_overlay()
+        if overlay is not None:
+            rules = load_overlay(overlay, rules)
         report = run(args, rules)
     except IntegrityError as exc:
         return fail(args, str(exc))

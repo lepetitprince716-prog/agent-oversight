@@ -117,6 +117,78 @@ repository turns on `local_only`, and `public = true` with it turns on `guard_of
   is refused when the config is read.
 - `reconcile --json` prints the same report for a program.
 
+## The commit check
+
+`tools/check_integrity.py` reads commits and flags the ones that weaken a check instead of
+passing it: a test skipped or deleted, assertions dropped, a linter or type checker silenced, a
+hook or CI step bypassed, a line removed from a check config. It is one file with a rules file
+next to it, standard library only.
+
+A flagged commit passes when its message has a top-level line
+`Check-change: <reason>` with a reason of 20 or more characters. One line covers every finding
+of that commit. Only the commit message counts: a reason written next to the code does not.
+
+Each rule has a level. `block`, the default, needs that line, otherwise the run exits 1. `note`
+is printed and counted but never fails the run and needs no line. In the shipped rules only
+`suppression-added` (a new `# noqa`, `# type: ignore`, `eslint-disable` and the like) is a note:
+such a marker is usually a local judgment, and asking a reason for each one turns the line into
+routine.
+
+```bash
+python3 tools/check_integrity.py --staged --message-file .git/COMMIT_EDITMSG   # what a commit-msg hook runs
+python3 tools/check_integrity.py --commit HEAD                                 # one commit
+python3 tools/check_integrity.py --range origin/main..HEAD                     # each commit in a range
+python3 tools/check_integrity.py --pre-push < refs                             # the lines git gives a pre-push hook
+```
+
+Exit code 0 means no blocking finding or every one justified, 1 means an unjustified blocking
+finding, 2 means the tool could not do its job (an unreadable rules file, a failed git call, a
+diff it cannot parse): it never passes by default. `--json` prints the same report for a
+program, with a level on each finding.
+
+### Adjusting the rules for one repository
+
+A `.check-integrity.json` at the top of a repository is laid over the rules. Per rule id it may
+set `severity` and append `allow` regexes, nothing else; any other key, or an id the rules do
+not have, is an error (exit 2). `allow` regexes are tried at the start of each pattern match,
+in every file the rule covers.
+
+```json
+{
+  "version": 1,
+  "rules": {
+    "skip-added": { "severity": "note" },
+    "bypass-added": { "allow": ["\\|\\|\\s*true\\b.*# best effort"] }
+  }
+}
+```
+
+The file is itself a check file: removing a line from it needs a `Check-change:` line like any
+other weakening. `--overlay PATH` reads another file, and `--no-overlay` reads none.
+
+This repository's own file spares the marker strings that the scanner's tests hold as data: a
+`skip-added` match on a line that also holds a literal `\n`, or that sits right after the
+scanner's own output text. Editing those strings needs no reason line; deleting a test or an
+assertion still does.
+
+### Using it in another repository
+
+Copy `tools/check_integrity.py` and `tools/check_integrity_rules.json`, then call it from the
+repository's hooks. The first lines of this repository's `.githooks/commit-msg` and
+`.githooks/pre-push` show how to run it next to another check so that either one refuses.
+
+```sh
+#!/bin/sh
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+python3 tools/check_integrity.py --staged --message-file "$1"
+```
+
+For a pre-push hook, pipe git's standard input into `--pre-push`; a new branch is scanned for
+the commits that no remote-tracking branch has. [.github/workflows/ci.yml](.github/workflows/ci.yml)
+runs the same scan on every push and pull request, taking the scanner, its rules and
+`.check-integrity.json` from the base branch on a pull request.
+
 ## The templates
 
 - [templates/handoff.md](templates/handoff.md): the handoff file and its writing rules

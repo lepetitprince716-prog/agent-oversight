@@ -88,11 +88,12 @@ class Repo:
         else:
             self.write(path, content)
 
-    def scan(self, *args):
+    def scan(self, *args, stdin=None):
         done = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), *args],
             cwd=self.root,
             env=self.env,
+            input=None if stdin is None else stdin.encode(),
             capture_output=True,
             check=False,
         )
@@ -539,11 +540,14 @@ class RangeAndErrors(RepoCase):
         first = self.repo.commit(
             f"Park\n\n{REASON}\n", tests__test_a_py=BASE_TEST.replace("assert 2 == 2", "pass")
         )
-        second = self.repo.commit(src__b_py="x = 1  # type: ignore\n")
+        skipped = BASE_TEST.replace("assert 2 == 2", "pass").replace(
+            "    def test_two", "    @unittest.skip('x')\n    def test_two"
+        )
+        second = self.repo.commit(tests__test_a_py=skipped)
         code, out, _ = self.repo.scan("--range", f"{base}..HEAD")
         self.assertEqual(code, 1)
         self.assertIn(f"{first[:7]} tests/test_a.py:8 assertion-loss justified", out)
-        self.assertIn(f"{second[:7]} src/b.py:1 suppression-added  x = 1", out)
+        self.assertIn(f"{second[:7]} tests/test_a.py:7 skip-added  @unittest.skip('x')", out)
         self.assertIn("1 finding(s) without justification (2 commits, 2 files)", out)
 
     def test_empty_range_is_ok(self):
@@ -842,6 +846,443 @@ class NarrowedRules(RepoCase):
         )
         self.repo.commit(src__y_py=None, tests__test_x_py=None)
         self.assertEqual(self.rules_at_head(), {("tests/test_x.py", 0, "test-removed", False)})
+
+
+class Severity(RepoCase):
+    """Two levels: a block finding needs a Check-change line, a note never fails the run."""
+
+    def seed(self):
+        self.repo.commit(tests__test_thing_py=BASE_TEST, src__a_py="x = 1\n")
+
+    def test_default_table_has_one_note_rule_and_the_rest_block(self):
+        rules = ci.load_rules(RULES)
+        levels = {rule.id: rule.severity for rule in rules.rules}
+        self.assertEqual({i for i, level in levels.items() if level == "note"}, {"suppression-added"})
+        self.assertEqual({level for level in levels.values()}, {"block", "note"})
+
+    def test_a_note_alone_exits_0_prints_it_and_counts_it(self):
+        self.seed()
+        self.repo.commit(src__a_py="x = f()  # noqa: BLE001\n")
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertRegex(out, r"src/a\.py:1 suppression-added note  x = f\(\)  # noqa: BLE001")
+        self.assertEqual(
+            out.splitlines()[-1], "check-integrity: ok (1 commits, 1 files, 1 note(s), not blocking)"
+        )
+
+    def test_json_carries_the_level_and_the_counts(self):
+        self.seed()
+        self.repo.commit(src__a_py="x = f()  # noqa: BLE001\n")
+        code, report = self.head_json()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            (report["status"], report["blocking"], report["notes"]), ("ok", 0, 1), report
+        )
+        self.assertEqual([f["severity"] for f in report["findings"]], ["note"])
+        self.repo.commit(tests__test_thing_py=BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two"))
+        code, report = self.head_json()
+        self.assertEqual(code, 1)
+        self.assertEqual((report["status"], report["blocking"], report["notes"]), ("findings", 1, 0))
+        self.assertEqual([f["severity"] for f in report["findings"]], ["block"])
+
+    def test_a_block_finding_still_exits_1_next_to_a_note(self):
+        self.seed()
+        self.repo.commit(
+            src__a_py="x = f()  # noqa: BLE001\n",
+            tests__test_thing_py=BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two"),
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 1, out)
+        self.assertIn("skip-added  @unittest.skip('x')", out)
+        self.assertIn("suppression-added note", out)
+        self.assertIn("1 finding(s) without justification", out.splitlines()[-1])
+        self.assertIn("1 note(s) do not block", out.splitlines()[-1])
+
+    def test_a_check_change_line_changes_nothing_for_a_note(self):
+        self.seed()
+        self.repo.commit(f"Quiet it\n\n{REASON}\n", src__a_py="x = f()  # noqa: BLE001\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.assertIn("suppression-added note", out)
+
+    def test_staged_note_exits_0(self):
+        self.seed()
+        self.repo.write("src/a.py", "x = f()  # noqa: BLE001\n")
+        self.repo.git("add", "-A")
+        code, out, _ = self.repo.scan("--staged")
+        self.assertEqual(code, 0, out)
+        self.assertIn("staged src/a.py:1 suppression-added note", out)
+
+    def test_rules_file_severity_is_validated(self):
+        document = json.loads(RULES.read_text())
+        bad = Path(self._tmp.name) / "bad.json"
+        document["rules"][0]["severity"] = "warn"
+        bad.write_text(json.dumps(document))
+        with self.assertRaises(ci.IntegrityError):
+            ci.load_rules(bad)
+        document["rules"][0]["severity"] = "block"
+        document["rules"].append(dict(document["rules"][0], severity="note"))
+        bad.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ci.IntegrityError, "share one severity"):
+            ci.load_rules(bad)
+
+    def test_a_rule_without_severity_blocks(self):
+        document = json.loads(RULES.read_text())
+        for rule in document["rules"]:
+            rule.pop("severity", None)
+        custom = Path(self._tmp.name) / "custom.json"
+        custom.write_text(json.dumps(document))
+        self.seed()
+        self.repo.commit(src__a_py="x = f()  # noqa: BLE001\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD", "--rules", str(custom))
+        self.assertEqual(code, 1, out)
+        self.assertNotIn(" note ", out)
+
+
+class Overlay(RepoCase):
+    """A repository's .check-integrity.json sets severity and appends allow-regexes per rule id."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.commit(tests__test_thing_py=BASE_TEST, src__a_py="x = 1\n")
+
+    def overlay(self, document):
+        """Write and commit the overlay, so that the commit under test holds only its change."""
+        text = document if isinstance(document, str) else json.dumps(document)
+        self.repo.commit("Set the overlay", **{".check-integrity.json": text})
+
+    def skip_commit(self, reason="x"):
+        return self.repo.commit(
+            tests__test_thing_py=BASE_TEST.replace(
+                "    def test_two", f"    @unittest.skip({reason!r})\n    def test_two"
+            )
+        )
+
+    def test_overlay_can_turn_a_note_into_a_block(self):
+        self.overlay({"version": 1, "rules": {"suppression-added": {"severity": "block"}}})
+        self.repo.commit(src__a_py="x = f()  # noqa: BLE001\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn(" note ", out)
+
+    def test_overlay_can_turn_a_block_into_a_note(self):
+        self.overlay({"version": 1, "rules": {"skip-added": {"severity": "note"}}})
+        self.skip_commit()
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.assertIn("skip-added note  @unittest", out)
+
+    def test_overlay_allow_is_appended_to_that_rule_only(self):
+        self.overlay({"version": 1, "rules": {"skip-added": {"allow": ["@unittest\\.skip\\('waived"]}}})
+        self.skip_commit("waived by the owner")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 1 files)"))
+        self.skip_commit("not waived")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 1, out)
+        self.repo.commit(**{".githooks/pre-push": "git push --no-verify\n"})
+        self.assertIn("bypass-added", self.rule_names())
+
+    def test_overlay_is_found_from_a_subfolder_of_the_repository(self):
+        self.overlay({"rules": {"skip-added": {"severity": "note"}}})
+        self.skip_commit()
+        (self.repo.root / "sub").mkdir()
+        done = subprocess.run(
+            [sys.executable, "-B", str(SCRIPT), "--commit", "HEAD"],
+            cwd=self.repo.root / "sub",
+            env=self.repo.env,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_a_broken_overlay_exits_2_and_says_why(self):
+        self.skip_commit()
+        cases = {
+            "{not json": "cannot read",
+            "[]": "expected a JSON object",
+            json.dumps({"version": 2, "rules": {}}): "must be 1",
+            json.dumps({"version": 1, "rules": {}, "classes": {}}): "unknown key(s): classes",
+            json.dumps({"version": 1, "rules": {"no-such-rule": {"severity": "note"}}}): "no-such-rule",
+            json.dumps({"version": 1, "rules": {"skip-added": {"patterns": ["x"]}}}): "only ['allow', 'severity']",
+            json.dumps({"version": 1, "rules": {"skip-added": {"why": "w"}}}): "only ['allow', 'severity']",
+            json.dumps({"version": 1, "rules": {"skip-added": {"severity": "off"}}}): "severity must be",
+            json.dumps({"version": 1, "rules": {"skip-added": {"allow": ["("]}}}): "invalid pattern",
+            json.dumps({"version": 1, "rules": {"skip-added": {"allow": "x"}}}): "list of non-empty strings",
+            json.dumps({"version": 1, "rules": []}): "keyed by rule id",
+        }
+        for text, expected in cases.items():
+            with self.subTest(overlay=text):
+                self.overlay(text)
+                code, out, err = self.repo.scan("--commit", "HEAD")
+                self.assertEqual(code, 2, out + err)
+                self.assertIn(expected, err)
+                code, out, _ = self.repo.scan("--commit", "HEAD", "--json")
+                self.assertEqual((code, json.loads(out)["status"]), (2, "error"))
+
+    def test_no_overlay_and_explicit_overlay(self):
+        self.overlay("{not json")
+        self.skip_commit()
+        code, out, _ = self.repo.scan("--commit", "HEAD", "--no-overlay")
+        self.assertEqual(code, 1, out)  # the broken file is not read, the finding stands
+        other = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-overlay.json"
+        other.write_text(json.dumps({"rules": {"skip-added": {"severity": "note"}}}))
+        self.addCleanup(other.unlink)
+        code, out, _ = self.repo.scan("--commit", "HEAD", "--overlay", str(other))
+        self.assertEqual(code, 0, out)
+        code, _, err = self.repo.scan("--commit", "HEAD", "--overlay", str(other) + "-missing")
+        self.assertEqual(code, 2, err)
+        code, _, err = self.repo.scan("--commit", "HEAD", "--overlay", str(other), "--no-overlay")
+        self.assertEqual(code, 2, err)
+
+    def test_the_overlay_is_a_check_file_so_removing_a_line_from_it_is_reported(self):
+        self.overlay('{\n  "rules": {\n    "skip-added": {\n      "allow": ["a"]\n    }\n  }\n}\n')
+        self.overlay('{\n  "rules": {\n  }\n}\n')
+        self.assertIn(".check-integrity.json", {path for path, _, _, _ in self.rules_at_head()})
+
+
+class OwnOverlay(RepoCase):
+    """This repository's own .check-integrity.json spares the marker strings that the scanner's
+    tests hold as data, and nothing else of that file."""
+
+    OVERLAY = Path(__file__).resolve().parent.parent / ".check-integrity.json"
+    TEST_FILE = Path(__file__).resolve()
+
+    def setUp(self):
+        super().setUp()
+        self.text = self.TEST_FILE.read_text(encoding="utf-8")
+        self.repo.commit(tests__test_check_integrity_py=self.text)
+
+    def scan_head(self, overlay=True):
+        flag = ("--overlay", str(self.OVERLAY)) if overlay else ("--no-overlay",)
+        return self.repo.scan("--commit", "HEAD", *flag)
+
+    def test_changing_the_marker_strings_needs_no_reason_line(self):
+        changed = self.text.replace('"flaky"', '"flaky again"').replace("'later'", "'much later'")
+        changed = changed.replace(
+            "            \"tests/test_a.py\": \"    self.skipTest('later')\\n\",\n",
+            "            \"tests/test_a.py\": \"    self.skipTest('later')\\n\",\n"
+            "            \"tests/test_z.py\": \"    self.skipTest('new')\\n\",\n",
+        )
+        self.assertNotEqual(changed, self.text)
+        self.repo.commit(tests__test_check_integrity_py=changed)
+        code, out, _ = self.scan_head()
+        self.assertEqual(code, 0, out)
+        code, out, _ = self.scan_head(overlay=False)
+        self.assertEqual(code, 1, "without the overlay the same change needs a reason line:\n" + out)
+        self.assertIn("skip-added", out)
+
+    def test_touching_every_line_of_the_file_needs_no_reason_line(self):
+        touched = "".join(line.rstrip("\n") + "  \n" for line in self.text.splitlines(keepends=True))
+        self.repo.commit(tests__test_check_integrity_py=touched)
+        code, out, _ = self.scan_head()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.scan_head(overlay=False)[0] == 1, "the file does hold skip markers as data")
+
+    def test_removing_a_test_function_or_an_assertion_is_still_reported(self):
+        lines = self.text.splitlines(keepends=True)
+        name = "def test_empty_range_" + "is_ok"
+        start = next(n for n, line in enumerate(lines) if name in line)
+        end = start + 1
+        while lines[end].strip():
+            end += 1
+        without_test = "".join(lines[:start] + lines[end + 1 :])
+        self.assertNotIn(name, without_test)
+        self.repo.commit(tests__test_check_integrity_py=without_test)
+        self.assertIn(("tests/test_check_integrity.py", "test-removed"), self.found())
+        self.repo.git("reset", "-q", "--hard", "HEAD~1")
+        target = "        self.assertEqual(code, 1)\n"
+        self.assertIn(target, self.text)
+        self.repo.commit(tests__test_check_integrity_py=self.text.replace(target, "", 1))
+        self.assertIn(("tests/test_check_integrity.py", "assertion-loss"), self.found())
+        for rule in ("test-removed", "assertion-loss"):
+            self.assertEqual(self.scan_head()[0], 1, rule)
+
+    def found(self):
+        code, out, _ = self.repo.scan("--commit", "HEAD", "--overlay", str(self.OVERLAY), "--json")
+        return {(f["path"], f["rule"]) for f in json.loads(out)["findings"]}
+
+
+class PushRefs(RepoCase):
+    """--pre-push reads the lines git gives a pre-push hook and scans the commits they bring."""
+
+    ZERO = "0" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.skipped = BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two")
+        self.base = self.repo.commit(tests__test_thing_py=BASE_TEST)
+        self.bad = self.repo.commit("Park a test", tests__test_thing_py=self.skipped)
+        self.good = self.repo.commit(src__a_py="x = 1\n")
+        remote = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, env=self.repo.env)
+        self.addCleanup(lambda: __import__("shutil").rmtree(remote, ignore_errors=True))
+        self.repo.git("remote", "add", "origin", str(remote))
+
+    def push_scan(self, *lines):
+        return self.repo.scan("--pre-push", stdin="".join(line + "\n" for line in lines))
+
+    def line(self, local, remote, ref="refs/heads/main"):
+        return f"{ref} {local} {ref} {remote}"
+
+    def test_an_existing_branch_scans_remote_to_local(self):
+        code, out, err = self.push_scan(self.line(self.good, self.base))
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(f"{self.bad[:7]} tests/test_thing.py:7 skip-added", out)
+        self.assertIn("(2 commits, 2 files)", out)
+        code, out, err = self.push_scan(self.line(self.good, self.bad))
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 1 files)"), err)
+
+    def test_a_new_branch_scans_only_what_no_remote_branch_has(self):
+        self.repo.git("push", "-q", "origin", "main")  # the unjustified commit is already there
+        self.repo.git("checkout", "-q", "-b", "feat")
+        also_bad = self.repo.commit(
+            "Park another",
+            tests__test_thing_py=self.skipped.replace("    def test_one", "    @unittest.skip('y')\n    def test_one"),
+        )
+        fine = self.repo.commit(src__b_py="y = 2\n")
+        code, out, err = self.push_scan(self.line(fine, self.ZERO, "refs/heads/feat"))
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(f"{also_bad[:7]} tests/test_thing.py:4 skip-added", out)
+        self.assertNotIn(self.bad[:7], out)
+        self.assertIn("(2 commits, 2 files)", out)
+
+    def test_a_remote_sha_this_clone_does_not_have_is_treated_as_a_new_branch(self):
+        self.repo.git("push", "-q", "origin", "main")
+        extra = self.repo.commit("More", src__b_py="y = 2\n")
+        code, out, err = self.push_scan(self.line(extra, "1" * 40))
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 1 files)"), err)
+
+    def test_a_deleted_branch_scans_nothing(self):
+        code, out, err = self.push_scan(self.line(self.ZERO, self.good))
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (0 commits, 0 files)"), err)
+
+    def test_no_lines_and_blank_lines_scan_nothing(self):
+        for lines in ((), ("",)):
+            with self.subTest(lines=lines):
+                code, out, err = self.push_scan(*lines)
+                self.assertEqual((code, out.strip()), (0, "check-integrity: ok (0 commits, 0 files)"), err)
+
+    def test_two_refs_with_shared_commits_count_each_commit_once(self):
+        code, out, _ = self.push_scan(
+            self.line(self.good, self.base), self.line(self.bad, self.base, "refs/heads/other")
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("(2 commits, 2 files)", out)
+
+    def test_malformed_lines_exit_2(self):
+        for line in (
+            "refs/heads/main",
+            f"refs/heads/main {self.good} refs/heads/main",
+            f"refs/heads/main --not refs/heads/main {self.base}",
+            f"refs/heads/main {self.good} refs/heads/main -x",
+        ):
+            with self.subTest(line=line):
+                code, out, err = self.push_scan(line)
+                self.assertEqual(code, 2, out + err)
+                self.assertIn("pre-push", err)
+
+
+class RepositoryHooks(unittest.TestCase):
+    """The real .githooks of this repository, run by git in a throwaway repository that holds
+    copies of its tools. These are the three cases a human or agent meets at commit time."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        (base / "work").mkdir()
+        self.repo = Repo(base / "work")
+        self.remote = base / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.remote)], check=True, env=self.repo.env)
+        self.repo.env.update(
+            GIT_AUTHOR_EMAIL="1+author@users.noreply.github.com",
+            GIT_COMMITTER_EMAIL="1+author@users.noreply.github.com",
+            AGENT_OVERSIGHT_PRIVATE_RULES=str(base / "no-private-rules.json"),
+        )
+        for name in ("privacy_scan.py", "privacy_rules.json", "check_integrity.py", "check_integrity_rules.json"):
+            self.repo.write(f"tools/{name}", (self.ROOT / "tools" / name).read_bytes())
+        for name in ("pre-commit", "commit-msg", "pre-push"):
+            self.repo.write(f".githooks/{name}", (self.ROOT / ".githooks" / name).read_bytes())
+            (self.repo.root / ".githooks" / name).chmod(0o755)
+        self.repo.git("config", "core.hooksPath", ".githooks")
+        self.repo.git("remote", "add", "origin", str(self.remote))
+        self.repo.write("tests/test_thing.py", BASE_TEST)
+        self.repo.write("src/a.py", "x = 1\n")
+        self.repo.git("add", "-A")
+        self.commit("Seed the repository")
+
+    def commit(self, message, *extra):
+        done = subprocess.run(
+            ["git", "commit", "-q", "-m", message, *extra],
+            cwd=self.repo.root,
+            env=self.repo.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return done.returncode, done.stdout + done.stderr
+
+    def stage(self, path, content):
+        self.repo.write(path, content)
+        self.repo.git("add", "--", path)
+
+    def head(self):
+        return self.repo.git("rev-parse", "HEAD")
+
+    def plumb_commit(self, message, parent="HEAD"):
+        """Commit the index on top of ``parent`` and move main there, running no hook."""
+        oid = self.repo.git("commit-tree", self.repo.git("write-tree"), "-p", parent, "-m", message)
+        self.repo.git("update-ref", "refs/heads/main", oid)
+
+    def test_a_skipped_test_without_a_reason_is_refused_and_with_one_is_accepted(self):
+        before = self.head()
+        self.stage(
+            "tests/test_thing.py", BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two")
+        )
+        code, out = self.commit("Park a test")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("skip-added", out)
+        self.assertEqual(self.head(), before)
+        code, out = self.commit(f"Park a test\n\n{REASON}")
+        self.assertEqual(code, 0, out)
+        self.assertNotEqual(self.head(), before)
+
+    def test_a_new_noqa_commits_and_prints_a_note(self):
+        before = self.head()
+        self.stage("src/a.py", "x = f()  # noqa: BLE001\n")
+        code, out = self.commit("Silence one line")
+        self.assertEqual(code, 0, out)
+        self.assertIn("suppression-added note", out)
+        self.assertNotEqual(self.head(), before)
+
+    def test_the_hook_runs_the_privacy_scan_too(self):
+        before = self.head()
+        self.stage("src/a.py", "x = 2\n")
+        code, out = self.commit("Contact 192.168." + "1.20 about it")
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual(self.head(), before)
+
+    def test_pre_push_refuses_an_unjustified_commit_and_accepts_it_once_justified(self):
+        self.repo.git("push", "-q", "origin", "main")
+        self.stage(
+            "tests/test_thing.py", BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two")
+        )
+        # The commit-msg hook would refuse this commit; write it with plumbing, which runs no
+        # hook, so that only the push check is under test.
+        self.plumb_commit("Park a test")
+        pushed = subprocess.run(
+            ["git", "push", "origin", "main"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
+        )
+        self.assertNotEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
+        self.assertIn("skip-added", pushed.stdout + pushed.stderr)
+        self.plumb_commit(f"Park a test\n\n{REASON}", parent="HEAD~1")
+        pushed = subprocess.run(
+            ["git", "push", "origin", "main"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
+        )
+        self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
 
 
 if __name__ == "__main__":

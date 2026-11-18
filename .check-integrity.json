@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "rules": {
+    "skip-added": {
+      "allow": [".*\\\\n", "(?<=skip-added  )", "(?<=skip-added justified  )"]
+    }
+  }
+}

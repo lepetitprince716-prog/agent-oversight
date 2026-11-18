@@ -1,4 +1,8 @@
 #!/bin/sh
 set -eu
 cd "$(git rev-parse --show-toplevel)"
-exec python3 tools/privacy_scan.py --message "$1"
+# Both checks run; either one failing refuses the commit.
+status=0
+python3 tools/privacy_scan.py --message "$1" || status=1
+python3 tools/check_integrity.py --staged --message-file "$1" || status=1
+exit "$status"
