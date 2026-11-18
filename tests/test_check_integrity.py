@@ -421,6 +421,20 @@ class ShortCircuitedTest(RepoCase):
                 self.repo.commit(**{path.replace("/", "__"): base.replace(anchor, line, 1)})
                 self.assertEqual(self.rules_at_head(), set())
 
+    def test_a_bare_return_as_the_first_statement_of_a_function_that_is_no_test_is_green(self):
+        helpers = "\n    def helper(self):\n        use()\n\n    def setUp(self):\n        use()\n"
+        cases = {
+            "python helper": ("tests/test_a.py", BASE_TEST + helpers, "    def helper(self):\n"),
+            "python setUp": ("tests/test_a.py", BASE_TEST + helpers, "    def setUp(self):\n"),
+            "go helper": ("pkg/a_test.go", "func helper() {\n\tuse()\n}\n", "func helper() {\n"),
+        }
+        for name, (path, base, anchor) in cases.items():
+            with self.subTest(name):
+                bare = "\treturn\n" if path.endswith(".go") else "        return\n"
+                self.repo.commit(**{path.replace("/", "__"): base})
+                self.repo.commit(**{path.replace("/", "__"): base.replace(anchor, anchor + bare, 1)})
+                self.assertEqual(self.rules_at_head(), set())
+
     def test_a_return_as_the_first_statement_is_red_in_each_form_of_a_test_definition(self):
         cases = {
             "async python test with a return type": (
@@ -579,13 +593,11 @@ class TautologyAdded(RepoCase):
         "js expect same string": ("web/a.test.ts", "  expect('a').toEqual('a')\n"),
         "rust assert true": ("crate/tests/a.rs", "    assert!(true);\n"),
         "rust assert true with a message": ("crate/tests/a.rs", "    assert!(true, \"ok\");\n"),
-        "assertEqual of one call": ("tests/test_a.py", "        self.assertEqual(f(), f())\n"),
-        "assertEqual of one call with arguments": ("tests/test_a.py", "        self.assertEqual(f(1, 'a'), f(1, 'a'), 'same')\n"),
         "assertIs of one attribute chain": ("tests/test_a.py", "        self.assertIs(a.b, a.b)\n"),
         "assertIs of one qualified name": ("tests/test_a.py", "        self.assertEqual(mod.Kind.X, mod.Kind.X)\n"),
         "assert of one name": ("tests/test_a.py", "        assert x == x\n"),
         "assert of one number": ("tests/test_a.py", "        assert 1 == 1\n"),
-        "assert of one call with a message": ("tests/test_a.py", "        assert f() == f(), 'same'\n"),
+        "assert of one attribute chain with a message": ("tests/test_a.py", "        assert a.b == a.b, 'same'\n"),
         "assertIsNone of None": ("tests/test_a.py", "        self.assertIsNone(None)\n"),
         "assertIsNotNone of a number": ("tests/test_a.py", "        self.assertIsNotNone(5)\n"),
         "assertIsNotNone of a string": ("tests/test_a.py", "        self.assertIsNotNone('a')\n"),
@@ -595,10 +607,9 @@ class TautologyAdded(RepoCase):
         "assertTrue of a string": ("tests/test_a.py", "        self.assertTrue('ok', 'fine')\n"),
         "assert of a number": ("tests/test_a.py", "        assert 1\n"),
         "assert of a string with a message": ("tests/test_a.py", "        assert 'ok', 'fine'\n"),
-        "js expect of one call": ("web/a.test.ts", "  expect(f()).toBe(f())\n"),
         "js expect of one name": ("web/a.test.ts", "  expect(value).toEqual(value)\n"),
         "rust assert_eq of one name": ("crate/tests/a.rs", "    assert_eq!(x, x);\n"),
-        "rust assert_eq of one call with a message": ("crate/tests/a.rs", "    assert_eq!(f(), f(), \"same\");\n"),
+        "rust assert_eq of one name with a message": ("crate/tests/a.rs", "    assert_eq!(x, x, \"same\");\n"),
         "rust debug_assert_eq of one field": ("crate/tests/a.rs", "    debug_assert_eq!(s.a, s.a);\n"),
     }
     GREEN = {
@@ -616,6 +627,11 @@ class TautologyAdded(RepoCase):
         "assertEqual of an attribute and its owner": "        self.assertEqual(a.b, a)\n",
         "assertEqual of a name and an item of it": "        self.assertEqual(x, x[0])\n",
         "assert of two names": "        assert x == y\n",
+        "assertEqual of one call written twice": "        self.assertEqual(f(x), f(x))\n",
+        "assertEqual of one call with arguments written twice": "        self.assertEqual(f(1, 'a'), f(1, 'a'), 'same')\n",
+        "assertEqual of one method call written twice": "        self.assertEqual(a.b(1), a.b(1))\n",
+        "assert of one call written twice": "        assert g() == g()\n",
+        "assert of one call written twice with a message": "        assert f() == f(), 'same'\n",
         "assert of a name and an item of it": "        assert x == x[0]\n",
         "assert of a comparison with a call": "        assert x == x.y()\n",
         "assert of equal names joined to another test": "        assert x == x and y\n",
@@ -635,6 +651,10 @@ class TautologyAdded(RepoCase):
         "js expect of a name and its item": ("web/a.test.ts", "  expect(x).toBe(x[0])\n"),
         "rust assert_eq of a name and a near name": ("crate/tests/a.rs", "    assert_eq!(x, x2);\n"),
         "rust assert_eq of two calls": ("crate/tests/a.rs", "    assert_eq!(f(1), f(2));\n"),
+        "js expect of one call written twice": ("web/a.test.ts", "  expect(k(d)).toEqual(k(d))\n"),
+        "js expect of one call written twice with toBe": ("web/a.test.ts", "  expect(f()).toBe(f())\n"),
+        "rust assert_eq of one call written twice": ("crate/tests/a.rs", "    assert_eq!(h(a), h(a));\n"),
+        "rust assert_eq of one call written twice with a message": ("crate/tests/a.rs", "    assert_eq!(f(), f(), \"same\");\n"),
     }
     HOST = {
         "tests/test_a.py": (BASE_TEST, "    def test_one(self):\n"),
@@ -782,6 +802,22 @@ class Justification(RepoCase):
                 self.repo.commit(message, tests__test_thing_py=self.skipped)
                 code, _, _ = self.repo.scan("--commit", "HEAD")
                 self.assertEqual(code, 1)
+                self.repo.git("reset", "-q", "--hard", "HEAD~1")
+
+    def test_a_reason_of_twenty_characters_counts_and_one_of_nineteen_does_not(self):
+        cases = (
+            ("Check-change: " + "x" * 20, 0),
+            ("Check-change: " + "x" * 19, 1),
+            ("Check-change:   " + "x" * 20 + "   ", 0),
+            ("Check-change:   " + "x" * 19 + "   ", 1),
+            ("Check-change:" + "x" * 20, 0),
+            ("Check-change:" + " " * 20, 1),
+        )
+        for line, expected in cases:
+            with self.subTest(line=line):
+                self.repo.commit(f"Park\n\n{line}\n", tests__test_thing_py=self.skipped)
+                code, out, _ = self.repo.scan("--commit", "HEAD")
+                self.assertEqual(code, expected, out)
                 self.repo.git("reset", "-q", "--hard", "HEAD~1")
 
     def test_staged_with_message_file(self):
@@ -1525,6 +1561,14 @@ class NarrowedRules(RepoCase):
             tests__test_x_py="def test_f():\n    assert f() == 1\n",
         )
         self.repo.commit(src__y_py=None, tests__test_x_py=None)
+        self.assertEqual(self.rules_at_head(), {("tests/test_x.py", 0, "test-removed", False)})
+
+    def test_test_deleted_while_its_source_is_only_changed_is_red(self):
+        self.repo.commit(
+            src__x_py="def f():\n    return 1\n",
+            tests__test_x_py="def test_f():\n    assert f() == 1\n",
+        )
+        self.repo.commit(src__x_py="def f():\n    return 2\n", tests__test_x_py=None)
         self.assertEqual(self.rules_at_head(), {("tests/test_x.py", 0, "test-removed", False)})
 
 
@@ -2456,6 +2500,40 @@ class CiScanStep(unittest.TestCase):
                 result, out = self.outcome(kind, origin_main, variables)
                 self.assertEqual(result, "passed", out)
                 self.assertIn("skip-added note", out)
+
+    RELAXED = json.dumps({"version": 1, "rules": {"skip-added": {"severity": "note"}}})
+
+    def test_a_later_push_is_not_judged_by_an_overlay_an_earlier_push_of_the_branch_brought(self):
+        # the range of an ordinary push starts at the old tip of the branch: its overlay is the branch's own
+        self.repo.git("checkout", "-q", "-b", "feature", self.base_sha)
+        old_tip = self.repo.commit(f"Relax the rules\n\n{REASON}", **{self.OVERLAY: self.RELAXED})
+        park = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        self.seed_baseline(self.base_sha)
+        code, out = self.run_step(REF="refs/heads/feature", BEFORE=old_tip, AFTER=park)
+        self.assertEqual(code, 1, out)
+        self.assertIn("skip-added", out)
+        self.assertNotIn("skip-added note", out)
+
+    def test_a_later_push_is_judged_by_the_overlay_of_the_default_branch_not_the_one_the_branch_dropped(self):
+        self.repo.git("checkout", "-q", "-b", "trunk", self.base_sha)
+        trunk = self.repo.commit(f"Relax the rules\n\n{REASON}", **{self.OVERLAY: self.RELAXED})
+        self.repo.git("checkout", "-q", "-b", "feature", trunk)
+        old_tip = self.repo.commit(f"Drop the overlay\n\n{REASON}", **{self.OVERLAY: None})
+        park = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        self.seed_baseline(trunk)
+        code, out = self.run_step(REF="refs/heads/feature", BEFORE=old_tip, AFTER=park)
+        self.assertEqual(code, 0, out)
+        self.assertIn("skip-added note", out)
+
+    def test_a_new_branch_is_judged_by_the_overlay_of_the_default_branch_not_of_its_fork_point(self):
+        self.repo.git("checkout", "-q", "-b", "trunk", self.base_sha)
+        trunk = self.repo.commit(f"Relax the rules\n\n{REASON}", **{self.OVERLAY: self.RELAXED})
+        self.repo.git("checkout", "-q", "-b", "feature", self.base_sha)
+        tip = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        self.seed_baseline(trunk)
+        code, out = self.run_step(REF="refs/heads/feature", BEFORE=self.ZERO, AFTER=tip)
+        self.assertEqual(code, 0, out)
+        self.assertIn("skip-added note", out)
 
     def test_a_baseline_without_a_scanner_leaves_the_commits_to_their_own(self):
         self.repo.git("checkout", "-q", "-b", "bare", self.base_sha)

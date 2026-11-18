@@ -98,6 +98,27 @@ python3 tools/check_integrity.py --pre-push < refs                             #
 覆盖 lint 和类型检查配置（类 `lint-config`：ruff、mypy、flake8、pylint、pyright、pytest.ini、setup.cfg、tox.ini、
 coverage、eslint、biome、clippy、deny、golangci、shellcheck、stylelint、markdownlint）。
 
+只在钩子或 CI 文件里挪版本号的改动是 `note`，不是 `block`：依赖机器人写不了理由行。哪些行的版本号机器人可以挪，列在规则表的
+`version_lines` 里：带固定版本或标签的 `uses:`、`runs-on`、运行时或工具链的版本键（`python-version`、`node-version` 等）、
+`image`、`container` 和 pre-commit 钩子的 `rev`。类 `bypass` 里的文件只是原地修改，而且每一处改动都能把一行被删的和一行
+新增的配成对（同一个 hunk、同一个顺序），两行把版本号（数字和点）和完整的十六进制摘要换成占位符之后是同一行，这个文件就报
+`note` 级的 `version-bumped`，不再报 `check-file-weakened` 和 `check-machinery-changed`。文件里有任何别的改动、版本行不在列表里、
+别的数字（超时、覆盖率下限）、换了另一个 action、文件被移动或改了类型、权限位变了，都仍然是 `block`。规则表没有
+`version_lines` 时什么都不算版本升级。叠加文件只能设 `version-bumped` 的级别；设成 `block` 就又要理由行了。
+
+三条规则抓「不删测试、直接改测试把它关掉」：
+
+- `test-short-circuited`：测试函数的第一句新增了光秃秃的 `return`（或 `return None`、`return;`），测试在断言之前就结束了，
+  但仍然通过。测试指 Python 的 `def test...`（含 async）、Rust 的任何 `fn`、JS 或 TS 的 `it(`、`test(` 回调和 Go 的
+  `func Test...`。规则看新文件里新增行的上一行，所以把 `return` 从一个测试挪到另一个会报，原本就在的不报。
+- `test-class-detached`：改动在所有测试文件里一共丢了一个带 `TestCase` 基类的类（基类被去掉，或类被删）：unittest 不再收集它的测试。
+- `tautology-added`：新增了不可能失败的断言：`assertTrue(True)`、`assertFalse(False)`、`assert True`、两边完全相同的
+  `assertEqual` 或 `assertIs`、`assert x == x`、`expect(x).toBe(x)`、`assert_eq!(x, x)`（一边是一个标识符、一条属性路径或一个
+  字面量）、`assertIsNone(None)`、对字面量的 `assertIsNotNone`，以及对非零数字或非空字符串的 `assertTrue` 和 `assert`。
+  只是挪了位置的行不算新增。
+
+这三条和别的发现一样，一行 `Check-change:` 就能放行。
+
 合并提交按这次合并在自动合并之外又改了什么来判（`git show --remerge-diff`）：干净的合并没有发现，被合并进来的提交
 各自只判一次。解决冲突时加了跳过、删了检查行，会报在合并提交上；解决冲突时去掉的冲突标记不算。这要 git 2.36 或更新：
 git 太旧，退出码为 2 并说明，不会换个办法硬判。章鱼合并（三个及以上父提交，git 不能对它做 remerge-diff）是一条
@@ -158,6 +179,19 @@ pre-push 钩子把 git 给的标准输入接到 `--pre-push`，并传远端的�
 默认分支的合并基点起的每个提交，没有合并基点时只扫最上面一个。推送到默认分支也扫它带来的提交，但那里的发现只是警告，步骤
 照样通过（推送已经落地，而压缩合并留下的提交不带原来各个提交的 `Check-change:` 行）；扫描器自己出错（退出码 2）仍然让
 步骤失败。第一次推送或强推到默认分支没有可扫的，会说明。
+
+### 提交检查的限制
+
+- 本地钩子和钩子调用的扫描器都来自工作区，有写权限的人或代理可以在本地把它们关掉。真正守得住的是 CI 那一步，它用基线上的
+  扫描器、规则表和叠加文件来判。
+- 推到默认分支的提交会被扫，但只打警告，不让那一步失败。
+- 规则是按行看的绊线，不是证明：把一个断言换成更弱但不恒真的断言、把检查逻辑挪进一个不在 `machinery` 类里的脚本，都看不出来；
+  仓库可以在自己的规则表里把这类脚本加进 `machinery` 类。
+- 带理由行的提交会通过：理由行的作用是让这类改动在 `git log` 里查得到，不是拦住它。
+- 抓「直接改测试」的三条规则各有看不到的写法。`test-short-circuited` 只认测试函数的第一句是光秃秃的 `return`：测试中途的条件
+  返回、定义行和 `return` 之间隔着 docstring、定义行跨多行的，都看不出来。`test-class-detached` 只看一行里有没有 `TestCase`，
+  基类换成间接的 `TestCase` 子类会被报出来，是误报。`tautology-added` 只认规则表里列的写法：「同一个调用写两遍再比较」不算，
+  因为它和确定性测试分不开，别的恒真断言也看不出来。
 
 ## 模板
 

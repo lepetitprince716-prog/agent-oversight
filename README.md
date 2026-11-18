@@ -167,6 +167,36 @@ for added lines covers lint and type-check configuration (the class `lint-config
 flake8, pylint, pyright, pytest.ini, setup.cfg, tox.ini, coverage, eslint, biome, clippy, deny,
 golangci, shellcheck, stylelint, markdownlint) as it does `pyproject.toml`.
 
+A change that only moves version numbers in a hook or CI file is a note, not a block, because
+dependency bots cannot write a reason line. The rules file lists the lines whose version a bot
+may move in `version_lines`: a pinned or tagged `uses:`, `runs-on`, the version key of a runtime
+or toolchain (`python-version`, `node-version` and the like), `image`, `container` and the `rev`
+of a pre-commit hook. When a file of the class `bypass` is only modified in place and every
+changed line pairs a removed with an added line (same hunk, same order) that is the same version
+line once its version numbers and full hex digests are replaced by placeholders, the file reports
+the note `version-bumped` instead of `check-file-weakened` and `check-machinery-changed`. Any other
+changed line in the file, a version line outside the list, another number (a timeout, a coverage
+floor), a different action, a moved or retyped file or new permission bits keeps the blocking
+findings. Without `version_lines` nothing is a bump. The overlay may only set the severity of
+`version-bumped`; `block` makes a bump need a reason line again.
+
+Three rules catch a test that is switched off by editing it, not by deleting it:
+
+- `test-short-circuited` fires on a bare `return` (or `return None`, or `return;`) that is the
+  first statement of a test: the test ends before its assertions and still passes. A test is a
+  Python `def test...` (async included), any Rust `fn`, a JS or TS `it(` or `test(` callback and a
+  Go `func Test...`. The rule reads the line above the added line in the new file, so a return
+  moved from one test to another is reported and one that was already there is not.
+- `test-class-detached` fires when the change loses a class with a `TestCase` base over all test
+  files (the base dropped, or the class deleted): unittest no longer collects its tests.
+- `tautology-added` fires on an added assertion that cannot fail: `assertTrue(True)`,
+  `assertFalse(False)`, `assert True`, `assertEqual` or `assertIs` of two identical sides,
+  `assert x == x`, `expect(x).toBe(x)`, `assert_eq!(x, x)` (a side is one identifier, one
+  attribute path or one literal), `assertIsNone(None)`, `assertIsNotNone` of a literal, and
+  `assertTrue` or `assert` of a non-zero number or a non-empty string. A moved line is not new.
+
+A `Check-change:` line waives each of the three like any other finding.
+
 A merge commit is judged by what the merge changed beyond the automatic merge
 (`git show --remerge-diff`), so a clean merge has no findings and the commits it brought in are
 judged on their own, once. A resolution that adds a skip or drops a check line is reported on the
@@ -252,6 +282,28 @@ finding there is a warning and the step passes (the push has landed, and a squas
 commits that carry none of the `Check-change:` lines of the commits it was made of); an error of
 the scanner (exit 2) still fails the step. The first push or a force push to the default branch
 has nothing to scan and says so.
+
+### Limits of the commit check
+
+- The local hooks, and the scanner they call, come from the working tree. Anyone or any agent
+  with write access can switch them off locally. What holds is the CI step, which judges with the
+  scanner, the rules and the overlay of the baseline.
+- A push to the default branch is scanned, but a finding there is only a warning: the step does
+  not fail.
+- The rules are tripwires that read one line at a time, not a proof. Swapping an assertion for a
+  weaker one that is not always true, or moving the checking logic into a script that is not in
+  the `machinery` class, goes unseen. A repository can add such a script to the `machinery` class
+  in its own rules file.
+- A commit with a reason line passes. The line exists so that such a change can be found in
+  `git log`, not to stop it.
+- Each of the three rules for tests edited in place has forms it does not see.
+  `test-short-circuited` sees only a bare `return` as the first statement of a test: a
+  conditional return in the middle of a test, a docstring or a multi-line definition between the
+  definition line and the `return` are not seen. `test-class-detached` looks for `TestCase` on one
+  line, so a base changed to an indirect subclass of `TestCase` is reported although the tests
+  are still collected (a false positive). `tautology-added` knows only the forms in its table:
+  the same call written twice and compared is not one of them, because it cannot be told from a
+  deterministic test, and other always-true assertions go unseen.
 
 ## The templates
 
