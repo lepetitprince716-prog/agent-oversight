@@ -1077,6 +1077,25 @@ class Severity(RepoCase):
         self.assertNotIn(" note ", out)
 
 
+BROKEN_OVERLAYS = {
+    "{not json": "cannot read",
+    "[]": "expected a JSON object",
+    json.dumps({"version": 2, "rules": {}}): "must be 1",
+    json.dumps({"version": 1, "rules": {}, "classes": {}}): "unknown key(s): classes",
+    json.dumps({"version": 1, "rules": {"no-such-rule": {"severity": "note"}}}): "no-such-rule",
+    json.dumps({"version": 1, "rules": {"skip-added": {"patterns": ["x"]}}}): "only ['allow', 'exempt_paths', 'severity']",
+    json.dumps({"version": 1, "rules": {"skip-added": {"why": "w"}}}): "only ['allow', 'exempt_paths', 'severity']",
+    json.dumps({"version": 1, "rules": {"skip-added": {"severity": "off"}}}): "severity must be",
+    json.dumps({"version": 1, "rules": {"skip-added": {"allow": ["("]}}}): "invalid pattern",
+    json.dumps({"version": 1, "rules": {"skip-added": {"allow": "x"}}}): "list of non-empty strings",
+    json.dumps({"version": 1, "rules": []}): "keyed by rule id",
+    json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": "tests/x.py"}}}): "list of non-empty strings",
+    json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": [""]}}}): "list of non-empty strings",
+    json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": [3]}}}): "list of non-empty strings",
+    json.dumps({"version": 1, "rules": {"check-machinery-changed": {"allow": ["x"]}}}): "no line to allow",
+}
+
+
 class Overlay(RepoCase):
     """A repository's .check-integrity.json sets severity and appends allow-regexes per rule id."""
 
@@ -1181,31 +1200,17 @@ class Overlay(RepoCase):
         )
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-    def test_a_broken_overlay_exits_2_and_says_why(self):
+    def test_a_broken_explicit_overlay_exits_2_and_says_why(self):
         self.skip_commit()
-        cases = {
-            "{not json": "cannot read",
-            "[]": "expected a JSON object",
-            json.dumps({"version": 2, "rules": {}}): "must be 1",
-            json.dumps({"version": 1, "rules": {}, "classes": {}}): "unknown key(s): classes",
-            json.dumps({"version": 1, "rules": {"no-such-rule": {"severity": "note"}}}): "no-such-rule",
-            json.dumps({"version": 1, "rules": {"skip-added": {"patterns": ["x"]}}}): "only ['allow', 'exempt_paths', 'severity']",
-            json.dumps({"version": 1, "rules": {"skip-added": {"why": "w"}}}): "only ['allow', 'exempt_paths', 'severity']",
-            json.dumps({"version": 1, "rules": {"skip-added": {"severity": "off"}}}): "severity must be",
-            json.dumps({"version": 1, "rules": {"skip-added": {"allow": ["("]}}}): "invalid pattern",
-            json.dumps({"version": 1, "rules": {"skip-added": {"allow": "x"}}}): "list of non-empty strings",
-            json.dumps({"version": 1, "rules": []}): "keyed by rule id",
-            json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": "tests/x.py"}}}): "list of non-empty strings",
-            json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": [""]}}}): "list of non-empty strings",
-            json.dumps({"version": 1, "rules": {"skip-added": {"exempt_paths": [3]}}}): "list of non-empty strings",
-        }
-        for text, expected in cases.items():
+        path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-broken-overlay.json"
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        for text, expected in BROKEN_OVERLAYS.items():
             with self.subTest(overlay=text):
-                self.overlay(text)
-                code, out, err = self.repo.scan("--commit", "HEAD")
+                path.write_text(text)
+                code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(path))
                 self.assertEqual(code, 2, out + err)
                 self.assertIn(expected, err)
-                code, out, _ = self.repo.scan("--commit", "HEAD", "--json")
+                code, out, _ = self.repo.scan("--commit", "HEAD", "--overlay", str(path), "--json")
                 self.assertEqual((code, json.loads(out)["status"]), (2, "error"))
 
     def test_no_overlay_and_explicit_overlay(self):
@@ -1373,14 +1378,323 @@ class OverlayGuard(RepoCase):
         self.assertEqual(code, 0, out)
 
     def test_the_overlay_cannot_change_that_rule(self):
+        explicit = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-guard-overlay.json"
+        self.addCleanup(lambda: explicit.unlink(missing_ok=True))
         for change in ({"severity": "note"}, {"allow": ["x"]}, {"exempt_paths": [".check-integrity.json"]}):
             with self.subTest(change=change):
                 text = json.dumps({"rules": {"overlay-changed": change}})
-                self.repo.commit("Set the overlay", **{self.OVERLAY: text})
-                code, out, err = self.repo.scan("--commit", "HEAD")
+                explicit.write_text(text)
+                code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(explicit))
                 self.assertEqual(code, 2, out)
                 self.assertIn("overlay-changed", err)
                 self.assertIn("cannot", err)
+                # committed, it is a broken overlay of the baseline of the next commit: warned
+                # about, applied as nothing, and the next commit is still judged
+                self.repo.commit("Set the overlay", **{self.OVERLAY: text})
+                self.repo.commit("Touch a file", src__a_py=f"x = {len(text)}\n")
+                code, out, err = self.repo.scan("--commit", "HEAD")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("cannot change this rule", err)
+
+
+OVERLAY_FILE = ".check-integrity.json"
+NOTE_SKIPS = {"version": 1, "rules": {"skip-added": {"severity": "note"}}}
+# skip-added ignores files a change adds, so a root commit is probed with suppression-added,
+# a note by default, which this overlay turns into a block
+BLOCK_NOQA = {"version": 1, "rules": {"suppression-added": {"severity": "block"}}}
+NOQA = "x = f()  # noqa: BLE001\n"
+
+
+def noqa_severities(output):
+    return {f["severity"] for f in json.loads(output)["findings"] if f["rule"] == "suppression-added"}
+
+
+class BaselineOverlay(RepoCase):
+    """The overlay that judges a change is the one in the baseline the change is judged against
+    (HEAD for --staged, the first parent for --commit, the left end for --range), never the
+    working tree's and never the judged commit's own: otherwise a change could loosen its own
+    judge, or be judged by a file that is not the one its branch is governed by."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.repo.commit("Seed", tests__test_thing_py=BASE_TEST, src__a_py="x = 1\n")
+
+    def set_overlay(self, document=NOTE_SKIPS):
+        text = document if isinstance(document, (str, bytes)) else json.dumps(document)
+        return self.repo.commit(f"Set the overlay\n\n{REASON}", **{OVERLAY_FILE: text})
+
+    def drop_overlay(self):
+        return self.repo.commit(f"Drop the overlay\n\n{REASON}", **{OVERLAY_FILE: None})
+
+    def skip(self, name="test_one", message="Park a test"):
+        return self.repo.commit(message, tests__test_thing_py=skipped(BASE_TEST, name))
+
+    def stage_skip(self):
+        self.repo.write("tests/test_thing.py", skipped(BASE_TEST))
+        self.repo.git("add", "tests/test_thing.py")
+
+    def skip_findings(self, *args, stdin=None):
+        """(exit code, severities of the skip-added findings, standard error)."""
+        code, out, err = self.repo.scan(*args, "--json", stdin=stdin)
+        self.assertIn(code, (0, 1), out + err)
+        found = json.loads(out)["findings"]
+        return code, sorted({f["severity"] for f in found if f["rule"] == "skip-added"}), err
+
+    def fresh_repo(self):
+        root = Path(self._tmp.name) / "fresh"
+        root.mkdir()
+        return Repo(root)
+
+    # --staged: HEAD
+
+    def test_staged_ignores_a_working_tree_overlay_that_is_not_in_head(self):
+        self.repo.write(OVERLAY_FILE, json.dumps(NOTE_SKIPS))  # never staged
+        self.stage_skip()
+        self.assertEqual(self.skip_findings("--staged")[:2], (1, ["block"]))
+
+    def test_staged_uses_the_overlay_of_head_whatever_the_working_tree_holds(self):
+        self.set_overlay()
+        self.repo.write(OVERLAY_FILE, '{"version": 1}\n')  # edited, not staged
+        self.stage_skip()
+        self.assertEqual(self.skip_findings("--staged"), (0, ["note"], ""))
+
+    def test_staged_does_not_apply_an_overlay_it_adds_itself(self):
+        self.repo.write(OVERLAY_FILE, json.dumps(NOTE_SKIPS))
+        self.repo.git("add", OVERLAY_FILE)
+        self.stage_skip()
+        self.assertEqual(self.skip_findings("--staged")[:2], (1, ["block"]))
+
+    def test_staged_in_a_repository_without_commits_has_no_baseline_and_no_overlay(self):
+        fresh = self.fresh_repo()
+        fresh.write(OVERLAY_FILE, json.dumps(BLOCK_NOQA))
+        fresh.write("src/a.py", NOQA)
+        fresh.git("add", "-A")
+        message = Path(self._tmp.name) / "fresh-message"
+        message.write_text(f"Root\n\n{REASON}\n")
+        code, out, err = fresh.scan("--staged", "--message-file", str(message), "--json")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(noqa_severities(out), {"note"})  # a block would mean the overlay was applied
+
+    # --commit: the first parent
+
+    def test_a_commit_is_judged_by_the_overlay_of_its_first_parent(self):
+        self.set_overlay()
+        parked = self.skip()
+        self.drop_overlay()
+        self.assertEqual(self.skip_findings("--commit", parked), (0, ["note"], ""))
+
+    def test_a_commit_is_not_judged_by_the_overlay_it_brings(self):
+        self.repo.commit(
+            f"Both\n\n{REASON}", **{OVERLAY_FILE: json.dumps(NOTE_SKIPS)}, tests__test_thing_py=skipped(BASE_TEST)
+        )
+        self.assertEqual(self.skip_findings("--commit", "HEAD")[:2], (0, ["block"]))
+
+    def test_a_root_commit_has_no_baseline_and_no_overlay(self):
+        fresh = self.fresh_repo()
+        fresh.commit(f"Root\n\n{REASON}", **{OVERLAY_FILE: json.dumps(BLOCK_NOQA)}, src__a_py=NOQA)
+        code, out, err = fresh.scan("--commit", "HEAD", "--json")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(noqa_severities(out), {"note"})  # a block would mean the overlay was applied
+
+    def test_a_merge_commit_is_judged_by_the_overlay_of_its_first_parent(self):
+        self.set_overlay()
+        self.repo.git("checkout", "-q", "-b", "side")
+        self.drop_overlay()
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", "side")
+        merge = self.repo.commit("Merge side", tests__test_thing_py=skipped(BASE_TEST))
+        self.assertEqual(self.skip_findings("--commit", merge), (0, ["note"], ""))
+
+    # --range: the left end
+
+    def test_a_range_is_judged_by_the_overlay_at_its_left_end(self):
+        left = self.set_overlay()
+        self.skip()
+        self.drop_overlay()
+        self.skip("test_two", "Park another")
+        self.assertEqual(self.skip_findings("--range", f"{left}..HEAD"), (0, ["note"], ""))
+
+    def test_a_symmetric_range_is_judged_by_the_merge_base_and_a_plain_one_by_the_left_tip(self):
+        self.set_overlay()
+        self.repo.git("checkout", "-q", "-b", "side")
+        self.skip()
+        self.repo.git("checkout", "-q", "main")
+        self.drop_overlay()
+        self.assertEqual(self.skip_findings("--range", "main...side"), (0, ["note"], ""))
+        self.assertEqual(self.skip_findings("--range", "main..side")[:2], (1, ["block"]))
+
+    # an invalid overlay in the baseline
+
+    def test_an_invalid_overlay_in_the_baseline_warns_once_and_makes_every_rule_block(self):
+        for number, (text, expected) in enumerate(BROKEN_OVERLAYS.items()):
+            with self.subTest(overlay=text):
+                # every case starts from the seed, so each one adds a marker net of its own
+                self.repo.git("checkout", "-q", "-f", "-B", f"case{number}", self.base)
+                self.set_overlay(text)
+                self.repo.commit("Silence a line", src__a_py=f"x = f({number})  # noqa: BLE001\n")
+                code, out, err = self.repo.scan("--commit", "HEAD", "--json")
+                self.assertEqual(code, 1, out + err)
+                found = json.loads(out)["findings"]
+                self.assertEqual([(f["rule"], f["severity"]) for f in found], [("suppression-added", "block")])
+                self.assertEqual(len(err.strip().splitlines()), 1, err)
+                self.assertIn("warning", err)
+                self.assertIn(expected, err)
+
+    def test_the_warning_is_printed_once_for_a_whole_range(self):
+        left = self.set_overlay("{not json")
+        self.skip()
+        self.skip("test_two", "Park another")
+        code, out, err = self.repo.scan("--range", f"{left}..HEAD")
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(err.count("warning"), 1, err)
+
+    def test_an_overlay_that_is_not_a_regular_utf8_file_is_invalid_too(self):
+        def link():
+            os.symlink("elsewhere.json", self.repo.root / OVERLAY_FILE)
+
+        def folder():
+            self.repo.write(f"{OVERLAY_FILE}/inner.json", "{}\n")
+
+        def binary():
+            self.repo.write(OVERLAY_FILE, b'{"version": 1, "rules": {"skip-added": {"allow": ["\xff"]}}}')
+
+        for number, (what, make) in enumerate((("a symbolic link", link), ("a directory", folder), ("bytes that are not UTF-8", binary))):
+            with self.subTest(what):
+                self.repo.git("checkout", "-q", "-f", "-B", f"case{number}", self.base)
+                make()
+                self.repo.git("add", "-A")
+                self.repo.git("commit", "-q", "-m", "Odd overlay")
+                self.repo.commit("Silence a line", src__a_py="x = f()  # noqa: BLE001\n")
+                code, out, err = self.repo.scan("--commit", "HEAD", "--json")
+                self.assertEqual(code, 1, out + err)
+                found = json.loads(out)["findings"]
+                self.assertEqual([(f["rule"], f["severity"]) for f in found], [("suppression-added", "block")])
+                self.assertIn("warning", err)
+
+    def test_an_executable_overlay_file_is_read_like_any_other(self):
+        self.repo.write(OVERLAY_FILE, json.dumps(NOTE_SKIPS))
+        (self.repo.root / OVERLAY_FILE).chmod(0o755)
+        self.repo.commit(f"Set the overlay\n\n{REASON}")
+        self.skip()
+        self.assertEqual(self.skip_findings("--commit", "HEAD"), (0, ["note"], ""))
+
+    def test_the_commit_that_fixes_a_broken_overlay_is_not_blocked_by_it(self):
+        self.set_overlay("{not json")
+        self.repo.commit(f"Fix the overlay\n\n{REASON}", **{OVERLAY_FILE: json.dumps(NOTE_SKIPS)})
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("warning", err)
+        self.repo.git("reset", "-q", "--hard", "HEAD~1")
+        self.repo.write(OVERLAY_FILE, json.dumps(NOTE_SKIPS))
+        self.repo.git("add", OVERLAY_FILE)
+        message = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-fix-message"
+        message.write_text(f"Fix the overlay\n\n{REASON}\n")
+        self.addCleanup(lambda: message.unlink(missing_ok=True))
+        code, out, err = self.repo.scan("--staged", "--message-file", str(message))
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("warning", err)
+
+    def test_an_overlay_given_with_overlay_or_no_overlay_is_not_read_from_the_baseline(self):
+        self.set_overlay("{not json")
+        self.skip()
+        code, out, err = self.repo.scan("--commit", "HEAD", "--no-overlay")
+        self.assertEqual((code, err), (1, ""), out)
+        explicit = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-explicit-overlay.json"
+        explicit.write_text(json.dumps(NOTE_SKIPS))
+        self.addCleanup(lambda: explicit.unlink(missing_ok=True))
+        code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(explicit))
+        self.assertEqual((code, err), (0, ""), out)
+
+
+class PushBaseline(RepoCase):
+    """--pre-push judges each ref by the overlay at the remote side of the push; a new branch by
+    the one at its merge base with the remote's default branch (--remote names the remote), and
+    when that is not known by the one at the first parent of its oldest new commit."""
+
+    ZERO = "0" * 40
+
+    def setUp(self):
+        super().setUp()
+        remote = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-baseline-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, env=self.repo.env)
+        self.addCleanup(lambda: shutil.rmtree(remote, ignore_errors=True))
+        self.repo.git("remote", "add", "origin", str(remote))
+        self.repo.commit("Seed", tests__test_thing_py=BASE_TEST)
+        self.main = self.repo.commit(f"Set the overlay\n\n{REASON}", **{OVERLAY_FILE: json.dumps(NOTE_SKIPS)})
+        self.repo.git("push", "-q", "origin", "main")
+
+    def drop_overlay(self):
+        return self.repo.commit(f"Drop the overlay\n\n{REASON}", **{OVERLAY_FILE: None})
+
+    def skip(self, name="test_one"):
+        return self.repo.commit(f"Park {name}", tests__test_thing_py=skipped(BASE_TEST, name))
+
+    def push_scan(self, local, remote, branch, *flags):
+        """(exit code, severities of the skip-added findings, standard error) of one ref line."""
+        ref = f"refs/heads/{branch}"
+        code, out, err = self.repo.scan("--pre-push", *flags, "--json", stdin=f"{ref} {local} {ref} {remote}\n")
+        self.assertIn(code, (0, 1), out + err)
+        found = json.loads(out)["findings"]
+        return code, sorted({f["severity"] for f in found if f["rule"] == "skip-added"}), err
+
+    def set_remote_head(self):
+        self.repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+    def fork_of_a_pushed_branch(self):
+        """Branch b has one new commit and forks from branch a, which is on the remote and
+        dropped the overlay that the remote's default branch has."""
+        self.repo.git("checkout", "-q", "-b", "a")
+        self.drop_overlay()
+        self.repo.git("push", "-q", "origin", "a")
+        self.repo.git("checkout", "-q", "-b", "b")
+        return self.skip()
+
+    def test_an_existing_branch_is_judged_by_the_overlay_of_the_remote_side(self):
+        self.drop_overlay()
+        local = self.skip()
+        self.assertEqual(self.push_scan(local, self.main, "main"), (0, ["note"], ""))
+
+    def test_a_new_branch_is_judged_by_the_overlay_at_its_merge_base_with_the_remote_default_branch(self):
+        local = self.fork_of_a_pushed_branch()
+        self.set_remote_head()
+        self.assertEqual(self.push_scan(local, self.ZERO, "b", "--remote", "origin"), (0, ["note"], ""))
+
+    def test_a_new_branch_falls_back_to_the_parent_of_its_oldest_new_commit(self):
+        local = self.fork_of_a_pushed_branch()
+        no_head = (1, ["block"])  # the parent is the tip of a, which has no overlay
+        self.assertEqual(self.push_scan(local, self.ZERO, "b", "--remote", "origin")[:2], no_head)
+        self.set_remote_head()
+        self.assertEqual(self.push_scan(local, self.ZERO, "b")[:2], no_head)
+        self.assertEqual(self.push_scan(local, self.ZERO, "b", "--remote", "https://example.invalid/x.git")[:2], no_head)
+
+    def test_the_fallback_baseline_is_one_for_all_the_new_commits(self):
+        self.repo.git("checkout", "-q", "-b", "c")
+        self.drop_overlay()
+        local = self.skip()
+        self.assertEqual(self.push_scan(local, self.ZERO, "c"), (0, ["note"], ""))
+
+    def test_a_new_branch_from_the_root_has_no_baseline(self):
+        self.repo.git("checkout", "-q", "--orphan", "fresh")
+        self.repo.git("rm", "-q", "-r", "-f", "--cached", ".")
+        local = self.repo.commit(f"Root\n\n{REASON}", **{OVERLAY_FILE: json.dumps(BLOCK_NOQA)}, src__a_py=NOQA)
+        ref = "refs/heads/fresh"
+        code, out, err = self.repo.scan(
+            "--pre-push", "--remote", "origin", "--json", stdin=f"{ref} {local} {ref} {self.ZERO}\n"
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(noqa_severities(out), {"note"})  # a block would mean the overlay was applied
+
+    def test_a_push_that_fixes_a_broken_overlay_on_the_remote_is_not_blocked_by_it(self):
+        broken = self.repo.commit(f"Break the overlay\n\n{REASON}", **{OVERLAY_FILE: "{not json"})
+        fixed = self.repo.commit(f"Fix the overlay\n\n{REASON}", **{OVERLAY_FILE: json.dumps(NOTE_SKIPS)})
+        code, severities, err = self.push_scan(fixed, broken, "main")
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning", err)
+
+    def test_remote_belongs_to_pre_push(self):
+        code, out, err = self.repo.scan("--commit", "HEAD", "--remote", "origin")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--remote works only with --pre-push", err)
 
 
 class CiScanStep(unittest.TestCase):
@@ -1645,6 +1959,36 @@ class RepositoryHooks(unittest.TestCase):
             ["git", "push", "origin", "main"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
         )
         self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
+
+
+    def test_pre_push_of_a_new_branch_judges_it_by_the_overlay_of_the_remote_default_branch(self):
+        """The hook passes the name of the remote to the scanner: a new branch is judged by the
+        overlay at its merge base with that remote's default branch, not by the one at the
+        parent of its oldest new commit (here the tip of a branch that dropped the overlay)."""
+        overlay = ".check-integrity.json"
+        note = json.dumps({"version": 1, "rules": {"skip-added": {"severity": "note"}}})
+        self.stage(overlay, note)
+        code, out = self.commit(f"Set the overlay\n\n{REASON}")
+        self.assertEqual(code, 0, out)
+        self.repo.git("push", "-q", "origin", "main")
+        self.repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.repo.git("checkout", "-q", "-b", "a")
+        self.repo.git("rm", "-q", "--", overlay)
+        code, out = self.commit(f"Drop the overlay\n\n{REASON}")
+        self.assertEqual(code, 0, out)
+        self.repo.git("push", "-q", "origin", "a")
+        self.repo.git("checkout", "-q", "-b", "b")
+        self.stage(
+            "tests/test_thing.py", BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two")
+        )
+        # plumbing again: a's tip has no overlay, so the commit-msg hook would refuse this commit
+        oid = self.repo.git("commit-tree", self.repo.git("write-tree"), "-p", "HEAD", "-m", "Park a test")
+        self.repo.git("update-ref", "refs/heads/b", oid)
+        pushed = subprocess.run(
+            ["git", "push", "origin", "b"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
+        )
+        self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
+        self.assertIn("skip-added note", pushed.stdout + pushed.stderr)
 
 
 class PinnedGit(RepoCase):
@@ -2052,7 +2396,6 @@ class MachineryChanged(RepoCase):
         cases = (
             ({"severity": "note"}, (0, ["note"])),
             ({"exempt_paths": [".githooks/*"]}, (0, [])),
-            ({"allow": ["x"]}, (1, ["block"])),
         )
         for change, expected in cases:
             with self.subTest(change=change):
@@ -2061,6 +2404,34 @@ class MachineryChanged(RepoCase):
                 code, found = self.machinery_hits()
                 self.assertEqual((code, [f["severity"] for f in found]), expected)
                 self.put("Back", **{hook: MACHINERY[hook], ".check-integrity.json": None})
+
+    def test_the_overlay_cannot_allow_lines_of_a_rule_that_judges_whole_files(self):
+        """allow was accepted for such a rule and did nothing: a setting that looks like a
+        relief and is none. It is an invalid overlay now, and the mixed rule test-removed, which
+        also has a net-loss entry that reads lines, keeps its allow."""
+        hook = ".githooks/pre-push"
+        explicit = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-allow-overlay.json"
+        self.addCleanup(lambda: explicit.unlink(missing_ok=True))
+        explicit.write_text(json.dumps({"rules": {MACHINERY_RULE: {"allow": ["x"]}}}))
+        self.put("Hook", **{hook: MACHINERY[hook] + "exit 0\n"})
+        code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(explicit))
+        self.assertEqual(code, 2, out)
+        self.assertIn(MACHINERY_RULE, err)
+        self.assertIn("no line to allow", err)
+        document = json.loads(RULES.read_text())
+        document["rules"].append({"id": "gone", "kind": "deleted", "classes": ["test"], "why": "w"})
+        custom = Path(self._tmp.name) / "custom-rules.json"
+        custom.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ci.OverlayError, "no line to allow"):
+            ci.parse_overlay('{"rules": {"gone": {"allow": ["x"]}}}', "overlay", ci.load_rules(custom))
+        explicit.write_text(json.dumps({"rules": {"test-removed": {"allow": ["x"]}}}))
+        code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(explicit))
+        self.assertEqual(code, 1, out + err)  # accepted: the hook change is still the finding
+        self.put("Overlay", **{".check-integrity.json": json.dumps({"rules": {MACHINERY_RULE: {"allow": ["x"]}}})})
+        self.put("Hook again", **{hook: MACHINERY[hook]})
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("no line to allow", err)
 
     def custom_rules(self, machinery):
         document = json.loads(RULES.read_text())

@@ -8,9 +8,18 @@ a top-level line ``Check-change: <reason of 20 or more characters>``; one line c
 every finding of that commit. The rules live in ``check_integrity_rules.json``. A rule has
 a severity: ``block`` (the default) needs that line, ``note`` is printed and counted but
 never fails the run. A repository can adjust severities, add ``allow`` patterns and exempt
-paths in its own ``.check-integrity.json`` (see ``load_overlay``); any change to that file is
-itself a blocking finding (rule ``overlay-changed``). A merge commit is judged by what the
-merge changed beyond the automatic merge (``git show --remerge-diff``, git 2.36 or newer).
+paths in its own ``.check-integrity.json`` (see ``parse_overlay``); any change to that file is
+itself a blocking finding (rule ``overlay-changed``). The overlay that judges a change is the
+one in the change's baseline, never the working tree's and never the judged commit's own:
+HEAD for ``--staged``, the first parent for ``--commit``, the left end of ``--range`` (the
+merge base for ``A...B``), the remote side for ``--pre-push`` (for a new branch the merge base
+with the remote's default branch, else the first parent of its oldest new commit). An overlay
+in the baseline that is not valid is applied as nothing, every rule is judged as ``block``, and
+a warning goes to standard error: the commit that repairs the file must be able to pass. An
+overlay given with ``--overlay`` is read as it is, and an error in it ends the run.
+
+A merge commit is judged by what the merge changed beyond the automatic merge (``git show
+--remerge-diff``, git 2.36 or newer).
 The files that run the checks (hooks, CI workflows, this scanner and its rules file; class
 ``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
 deleted or moved file, other permission bits or another file type is a blocking finding
@@ -25,7 +34,8 @@ file deleted; the new side is not judged.
 
 Exit status: 0 no blocking finding, or every one justified; 1 an unjustified blocking
 finding; 2 a usage error, a revision that does not exist, a missing or too old git, a git call
-that fails, a broken rules file or a broken overlay file. The guard fails closed. Standard
+that fails, a broken rules file or a broken overlay file given with ``--overlay``. The guard
+fails closed. Standard
 library only; one file, so it can be copied into another repository together with its rules
 file.
 """
@@ -107,6 +117,12 @@ TEST_NAME = (
 
 class IntegrityError(Exception):
     """A usage, rules, git or parse problem; it ends the run with exit status 2."""
+
+
+class OverlayError(IntegrityError):
+    """An overlay that cannot be applied. For an overlay given with ``--overlay`` it ends the
+    run like any other IntegrityError; for the one in a baseline it is caught and becomes a
+    warning (see ``Judges``)."""
 
 
 # --- rules -------------------------------------------------------------------------
@@ -253,52 +269,70 @@ def load_rules(path: Path) -> RuleSet:
     return RuleSet(classes, rules)
 
 
-def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
-    """Apply a repository's own ``.check-integrity.json`` to the rules. The file is
-    ``{"version": 1, "rules": {"<rule id>": {"severity": "note", "allow": ["<regex>"],
-    "exempt_paths": ["<glob>"]}}}``: per rule id it may set the severity, append allow-regexes
-    and exempt files, whose repository-relative path matches a glob (``fnmatch`` rules: ``*``
-    also matches ``/``), from the rule. Nothing else. Any other key, or an id the rules do not
-    have, is an error, so the file cannot quietly change more than that. The ``overlay-changed``
-    rule cannot be set at all."""
+def parse_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
+    """Apply a repository's own ``.check-integrity.json`` (its text; ``where`` names it in
+    messages) to the rules. The file is ``{"version": 1, "rules": {"<rule id>": {"severity":
+    "note", "allow": ["<regex>"], "exempt_paths": ["<glob>"]}}}``: per rule id it may set the
+    severity, append allow-regexes and exempt files, whose repository-relative path matches a
+    glob (``fnmatch`` rules: ``*`` also matches ``/``), from the rule. Nothing else. Any other
+    key, or an id the rules do not have, is an error, so the file cannot quietly change more
+    than that. The ``overlay-changed`` and ``unreadable-change`` rules cannot be set at all, and
+    a rule that judges whole files (every entry of its id has the kind ``deleted`` or
+    ``changed``) has no line for ``allow`` to let pass, so setting it is an error too: an option
+    that is accepted and does nothing looks like a relief and is none. Every error is an
+    OverlayError."""
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise IntegrityError(f"cannot read {path}: {exc}") from exc
+        return apply_overlay(text, where, rules)
+    except OverlayError:
+        raise
+    except IntegrityError as exc:  # the list and pattern checks shared with the rules file
+        raise OverlayError(str(exc)) from exc
+
+
+def apply_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        raise OverlayError(f"cannot read {where}: {exc}") from exc
     if not isinstance(document, dict) or document.get("version", 1) != 1:
-        raise IntegrityError(f'{path}: expected a JSON object; "version", when present, must be 1')
+        raise OverlayError(f'{where}: expected a JSON object; "version", when present, must be 1')
     unknown = sorted(set(document) - OVERLAY_KEYS)
     if unknown:
-        raise IntegrityError(f"{path}: unknown key(s): {', '.join(unknown)}")
+        raise OverlayError(f"{where}: unknown key(s): {', '.join(unknown)}")
     changes = document.get("rules", {})
     if not isinstance(changes, dict):
-        raise IntegrityError(f"{path}: 'rules' must be an object keyed by rule id")
+        raise OverlayError(f"{where}: 'rules' must be an object keyed by rule id")
     known = {rule.id for rule in rules.rules}
     allow: dict[str, tuple[re.Pattern[str], ...]] = {}
     exempt: dict[str, tuple[str, ...]] = {}
     severity: dict[str, str] = {}
     for rule_id, change in changes.items():
-        where = f"{path}: rule {rule_id}"
+        here = f"{where}: rule {rule_id}"
         if rule_id == OVERLAY_GUARD:
-            raise IntegrityError(
-                f"{where}: the overlay cannot change this rule; any change to {OVERLAY_NAME} needs a reason line"
+            raise OverlayError(
+                f"{here}: the overlay cannot change this rule; any change to {OVERLAY_NAME} needs a reason line"
             )
         if rule_id == UNREADABLE:
-            raise IntegrityError(
-                f"{where}: the overlay cannot change this rule; a change the scanner cannot read always needs a reason line"
+            raise OverlayError(
+                f"{here}: the overlay cannot change this rule; a change the scanner cannot read always needs a reason line"
             )
         if rule_id not in known:
-            raise IntegrityError(f"{where}: no such rule (known: {', '.join(sorted(known))})")
+            raise OverlayError(f"{here}: no such rule (known: {', '.join(sorted(known))})")
         if not isinstance(change, dict) or set(change) - OVERLAY_RULE_KEYS:
-            raise IntegrityError(f"{where}: only {sorted(OVERLAY_RULE_KEYS)} may be set")
+            raise OverlayError(f"{here}: only {sorted(OVERLAY_RULE_KEYS)} may be set")
         if "severity" in change:
             if change["severity"] not in SEVERITIES:
-                raise IntegrityError(f"{where}: severity must be one of {sorted(SEVERITIES)}")
+                raise OverlayError(f"{here}: severity must be one of {sorted(SEVERITIES)}")
             severity[rule_id] = change["severity"]
         if "allow" in change:
-            allow[rule_id] = compile_list(change["allow"], f"{where} allow")
+            if all(rule.kind in LINELESS_KINDS for rule in rules.rules if rule.id == rule_id):
+                raise OverlayError(
+                    f"{here}: this rule judges whole files, so it has no line to allow; "
+                    "set its severity or exempt_paths instead"
+                )
+            allow[rule_id] = compile_list(change["allow"], f"{here} allow")
         if "exempt_paths" in change:
-            exempt[rule_id] = tuple(string_list(change["exempt_paths"], f"{where} exempt_paths"))
+            exempt[rule_id] = tuple(string_list(change["exempt_paths"], f"{here} exempt_paths"))
     return RuleSet(
         rules.classes,
         tuple(
@@ -313,11 +347,13 @@ def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
     )
 
 
-def repository_overlay() -> Path | None:
-    """The overlay file at the top of the repository the command runs in, if there is one."""
-    top = Path(os.fsdecode(git(["rev-parse", "--show-toplevel"]).rstrip(b"\n")))
-    path = top / OVERLAY_NAME
-    return path if path.is_file() else None
+def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
+    """The overlay file named with ``--overlay``, read from disk as it is."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        raise IntegrityError(f"cannot read {path}: {exc}") from exc
+    return parse_overlay(text, str(path), rules)
 
 
 # --- diff parsing --------------------------------------------------------------------
@@ -601,10 +637,14 @@ def resolve(rev: str) -> str:
     return git(["rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}"]).decode().strip()
 
 
+def parents_of(oid: str) -> list[str]:
+    return git(["rev-list", "--parents", "-n", "1", oid]).decode().split()[1:]
+
+
 def collect_commit(oid: str) -> list[FileDiff]:
     """The changes of one commit: against its parent, against the empty tree for a root
     commit, and for a merge commit against the automatic merge of its parents."""
-    parents = git(["rev-list", "--parents", "-n", "1", oid]).decode().split()[1:]
+    parents = parents_of(oid)
     if len(parents) > 2:
         reason = f"an octopus merge ({len(parents)} parents): git has no --remerge-diff for it"
         return [FileDiff(OCTOPUS_PATH, unreadable=reason)]
@@ -631,29 +671,137 @@ def has_commit(oid: str) -> bool:
     return run_git(["cat-file", "-e", f"{oid}^{{commit}}"]).returncode == 0
 
 
-def push_commits(refs: str) -> list[str]:
+class Judged(NamedTuple):
+    """A commit to judge and the commit whose overlay judges it (None: it has no baseline)."""
+
+    oid: str
+    baseline: str | None
+
+
+def range_baseline(spec: str) -> str | None:
+    """The commit whose overlay judges a range: its left end, for ``A...B`` the merge base of
+    both ends, an empty end standing for HEAD. None when the ends share no history."""
+    symmetric = "..." in spec
+    left, _, right = spec.partition("..." if symmetric else "..")
+    left_oid = resolve(left or "HEAD")
+    if not symmetric:
+        return left_oid
+    done = run_git(["merge-base", left_oid, resolve(right or "HEAD")])
+    if done.returncode == 1:  # git: no common ancestor
+        return None
+    if done.returncode != 0:
+        raise IntegrityError(f"git merge-base failed: {done.stderr.decode('utf-8', 'replace').strip()}")
+    return done.stdout.decode().strip()
+
+
+def head_commit() -> str | None:
+    """The commit HEAD names, or None in a repository that has none yet."""
+    done = run_git(["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"])
+    return done.stdout.decode().strip() if done.returncode == 0 else None
+
+
+def new_branch_baseline(local: str, new: list[str], remote: str | None) -> str | None:
+    """The commit whose overlay judges the new commits of a branch that is new on its remote:
+    the merge base of the branch with the remote's default branch (``refs/remotes/<remote>/HEAD``,
+    which ``git clone`` sets), and when that cannot be found the first parent of the oldest new
+    commit. None when there is no such commit."""
+    if remote:
+        head = run_git(["rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/remotes/{remote}/HEAD^{{commit}}"])
+        if head.returncode == 0:
+            base = run_git(["merge-base", local, head.stdout.decode().strip()])
+            if base.returncode == 0 and base.stdout.strip():
+                return base.stdout.decode().strip()
+    parents = parents_of(new[0]) if new else []
+    return parents[0] if parents else None
+
+
+def push_commits(refs: str, remote: str | None = None) -> list[Judged]:
     """The commits a push brings, oldest first, from the lines git gives a pre-push hook:
-    ``<local ref> <local sha> <remote ref> <remote sha>``. A deleted branch (local sha all
-    zeros) brings none. A new branch (remote sha all zeros), or one whose remote sha this
-    clone does not have, brings the commits of the local sha that no remote-tracking branch
-    holds. Any other ref brings ``remote sha..local sha``."""
-    seen: dict[str, None] = {}
+    ``<local ref> <local sha> <remote ref> <remote sha>``, each with the commit whose overlay
+    judges it. A deleted branch (local sha all zeros) brings none. A new branch (remote sha all
+    zeros), or one whose remote sha this clone does not have, brings the commits of the local
+    sha that no remote-tracking branch holds, judged by ``new_branch_baseline`` (``remote`` is
+    the name git gives the hook). Any other ref brings ``remote sha..local sha``, judged by the
+    overlay at the remote sha. A commit that several refs bring is judged by the first."""
+    seen: dict[str, str | None] = {}
     for line in refs.splitlines():
         if not line.strip():
             continue
         parts = line.split()
-        if len(parts) != 4 or not all(OBJECT_ID.fullmatch(p) or set(p) == {"0"} for p in parts[1::2]):
+        if len(parts) != 4 or not all(OBJECT_ID.fullmatch(p) or set(p) == {"0"} for p in (parts[1], parts[3])):
             raise IntegrityError(f"unexpected line from git for a pre-push hook: {line[:80]!r}")
-        local, remote = parts[1], parts[3]
+        local, remote_sha = parts[1], parts[3]
         if set(local) == {"0"}:
             continue
-        if set(remote) == {"0"} or not has_commit(remote):
-            spec = [local, "--not", "--remotes"]
+        if set(remote_sha) == {"0"} or not has_commit(remote_sha):
+            spec, known = [local, "--not", "--remotes"], False
         else:
-            spec = [f"{remote}..{local}"]
-        for oid in git(["rev-list", "--reverse", *spec, "--"]).decode().split():
-            seen.setdefault(oid)
-    return list(seen)
+            spec, known = [f"{remote_sha}..{local}"], True
+        new = git(["rev-list", "--reverse", *spec, "--"]).decode().split()
+        baseline = remote_sha if known else new_branch_baseline(local, new, remote)
+        for oid in new:
+            seen.setdefault(oid, baseline)
+    return [Judged(oid, baseline) for oid, baseline in seen.items()]
+
+
+# --- the overlay of a baseline ------------------------------------------------------
+
+
+def baseline_overlay(rev: str) -> str | None:
+    """The text of ``.check-integrity.json`` at the top of the tree of a commit; None if the
+    commit has no such entry. An entry that is not a regular file, or whose bytes are not
+    UTF-8, is an OverlayError."""
+    listing = git(["ls-tree", "-z", "--full-tree", rev, "--", OVERLAY_NAME])
+    for entry in listing.split(b"\0"):
+        meta, _, name = entry.partition(b"\t")
+        if name != OVERLAY_NAME.encode():
+            continue
+        mode, kind, oid = meta.decode("ascii", "replace").split(" ")
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise OverlayError(f"{OVERLAY_NAME} at {short(rev)} is not a regular file (mode {mode}, {kind})")
+        try:
+            return git(["cat-file", "blob", oid]).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OverlayError(f"{OVERLAY_NAME} at {short(rev)} is not valid UTF-8 ({exc.reason})") from exc
+    return None
+
+
+def short(rev: str) -> str:
+    return rev[:SHORT] if OBJECT_ID.fullmatch(rev) else rev
+
+
+class Judges:
+    """The rules a change is judged by. ``--overlay`` and ``--no-overlay`` fix them for the
+    whole run. Otherwise they are the rules with the overlay of the change's baseline
+    applied, read once per baseline. A baseline with no overlay, or none at all (a root
+    commit, a repository without commits), leaves the rules as they are. An overlay in the
+    baseline that is not valid applies nothing and makes every rule block, with one warning
+    on standard error: a commit that repairs the file would otherwise be judged by it."""
+
+    def __init__(self, rules: RuleSet, overlay: Path | None, no_overlay: bool) -> None:
+        self.rules = rules
+        self.fixed = rules if no_overlay else None if overlay is None else load_overlay(overlay, rules)
+        self.cache: dict[str | None, RuleSet] = {}
+
+    def at(self, baseline: str | None) -> RuleSet:
+        if self.fixed is not None:
+            return self.fixed
+        if baseline not in self.cache:
+            self.cache[baseline] = self.read(baseline)
+        return self.cache[baseline]
+
+    def read(self, baseline: str | None) -> RuleSet:
+        if baseline is None:
+            return self.rules
+        try:
+            text = baseline_overlay(baseline)
+            return self.rules if text is None else parse_overlay(text, f"{OVERLAY_NAME} at {short(baseline)}", self.rules)
+        except OverlayError as exc:
+            print(
+                f"{PROG}: warning: {' '.join(str(exc).split())}; no overlay is applied and every rule is judged as {BLOCK}",
+                file=sys.stderr,
+            )
+            return RuleSet(self.rules.classes, tuple(replace(rule, severity=BLOCK) for rule in self.rules.rules))
 
 
 # --- judging -------------------------------------------------------------------------
@@ -904,22 +1052,28 @@ class Report(NamedTuple):
         return sum(1 for f in self.findings if f.severity == NOTE)
 
 
-def run(args: argparse.Namespace, rules: RuleSet) -> Report:
+def run(args: argparse.Namespace, judges: Judges) -> Report:
     if args.staged:
         diffs = collect(["--cached"])
         message = read_message_file(args.message_file)
-        return Report(judge("staged", diffs, message, rules), 0, len(diffs), True)
+        return Report(judge("staged", diffs, message, judges.at(head_commit())), 0, len(diffs), True)
     if args.pre_push:
-        commits = push_commits(sys.stdin.read())
+        changes = push_commits(sys.stdin.read(), args.remote)
+    elif args.commit:
+        oid = resolve(args.commit)
+        parents = parents_of(oid)
+        changes = [Judged(oid, parents[0] if parents else None)]
     else:
-        commits = [resolve(args.commit)] if args.commit else range_commits(args.range)
+        commits = range_commits(args.range)
+        baseline = range_baseline(args.range) if commits else None
+        changes = [Judged(oid, baseline) for oid in commits]
     findings: list[Finding] = []
     files = 0
-    for oid in commits:
+    for oid, baseline in changes:
         diffs = collect_commit(oid)
         files += len(diffs)
-        findings += judge(oid[:SHORT], diffs, commit_message(oid), rules)
-    return Report(findings, len(commits), files, False)
+        findings += judge(oid[:SHORT], diffs, commit_message(oid), judges.at(baseline))
+    return Report(findings, len(changes), files, False)
 
 
 # --- command line --------------------------------------------------------------------
@@ -951,13 +1105,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--message-file", type=Path, metavar="PATH", help="with --staged: the commit message file"
     )
+    parser.add_argument(
+        "--remote",
+        metavar="NAME",
+        help="with --pre-push: the remote git is pushing to (the hook's first argument); a new "
+        "branch is judged by the overlay at its merge base with that remote's default branch",
+    )
     parser.add_argument("--rules", type=Path, metavar="PATH", default=DEFAULT_RULES)
     overlay = parser.add_mutually_exclusive_group()
     overlay.add_argument(
         "--overlay",
         type=Path,
         metavar="PATH",
-        help=f"apply this file instead of {OVERLAY_NAME} at the top of the repository",
+        help=f"apply this file instead of the {OVERLAY_NAME} of the baseline (HEAD, the first "
+        "parent, the left end of the range, the remote side of the push); an error in it exits 2",
     )
     overlay.add_argument("--no-overlay", action="store_true", help=f"ignore {OVERLAY_NAME}")
     parser.add_argument("--json", action="store_true", help="print a JSON report on stdout")
@@ -1010,13 +1171,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.message_file is not None and not args.staged:
         parser.error("--message-file works only with --staged")
+    if args.remote is not None and not args.pre_push:
+        parser.error("--remote works only with --pre-push")
     sys.stdout.reconfigure(errors="backslashreplace")
     try:
         rules = load_rules(args.rules)
-        overlay = None if args.no_overlay else args.overlay or repository_overlay()
-        if overlay is not None:
-            rules = load_overlay(overlay, rules)
-        report = run(args, rules)
+        report = run(args, Judges(rules, args.overlay, args.no_overlay))
     except IntegrityError as exc:
         return fail(args, str(exc))
     except Exception as exc:  # a crash must be 2, never a pass or a plain finding

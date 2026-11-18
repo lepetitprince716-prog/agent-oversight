@@ -5,5 +5,5 @@ cd "$(git rev-parse --show-toplevel)"
 refs=$(cat)
 status=0
 python3 tools/privacy_scan.py --history || status=1
-printf '%s\n' "$refs" | python3 tools/check_integrity.py --pre-push || status=1
+printf '%s\n' "$refs" | python3 tools/check_integrity.py --pre-push --remote "${1:-}" || status=1
 exit "$status"
