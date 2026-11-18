@@ -50,37 +50,22 @@ jobs:
           scanner=tools/check_integrity.py
           rules=tools/check_integrity_rules.json
           overlay=""
+          mode=--range
+          on_default=no
           if [ -n "$BASE_REF" ]; then
-            if git cat-file -e "origin/$BASE_REF:tools/check_integrity.py" 2>/dev/null; then
-              # As with the privacy scan: on a pull request the scanner, its rules and the
-              # repository's .check-integrity.json come from the base branch, so a change
-              # cannot loosen the checks it is judged by.
-              git show "origin/$BASE_REF:tools/check_integrity.py" > "$RUNNER_TEMP/check_integrity.py"
-              git show "origin/$BASE_REF:tools/check_integrity_rules.json" > "$RUNNER_TEMP/check_integrity_rules.json"
-              scanner="$RUNNER_TEMP/check_integrity.py"
-              rules="$RUNNER_TEMP/check_integrity_rules.json"
-              if ! grep -q -- '--no-overlay' "$scanner"; then
-                :  # an older scanner on the base branch knows no overlay file
-              elif git cat-file -e "origin/$BASE_REF:.check-integrity.json" 2>/dev/null; then
-                git show "origin/$BASE_REF:.check-integrity.json" > "$RUNNER_TEMP/check-integrity-overlay.json"
-                overlay="--overlay $RUNNER_TEMP/check-integrity-overlay.json"
-              else
-                overlay="--no-overlay"
-              fi
-            fi
-            # Otherwise the base branch has no scanner yet: this is the pull request that
-            # first adds it, so it is judged by its own copy. Read it before merging.
             # The head commit of the pull request, not the merge commit CI checks out: the
             # merge commit has no Check-change line and would be judged as a whole.
-            python3 -B "$scanner" --rules "$rules" $overlay --range "origin/$BASE_REF..$PR_HEAD"
+            judge="origin/$BASE_REF"
+            target="origin/$BASE_REF..$PR_HEAD"
           else
             if [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
-              # A pull request that lands here is squashed or merged into commits that carry
-              # none of the Check-change lines of the commits it was made of, and the pull
-              # request itself was judged commit by commit before it landed, so a push to the
-              # default branch has nothing left to add. Every other push is scanned.
-              echo "check-integrity: skipped on a push to the default branch ($DEFAULT_BRANCH): its pull request was scanned commit by commit"
-              exit 0
+              # The push has already landed, so a finding cannot stop it, and a pull request
+              # that was squashed carries none of the Check-change lines it was judged with.
+              # The commits are still scanned and a finding is shown as a warning.
+              on_default=yes
+              judge="$BEFORE"
+            else
+              judge="origin/$DEFAULT_BRANCH"
             fi
             case "$BEFORE" in
               *[!0]*) first=no ;;
@@ -89,9 +74,45 @@ jobs:
             if [ "$first" = no ] && ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
               first=yes # a force push: the old tip is not in this clone
             fi
-            if [ "$first" = yes ]; then
-              python3 -B "$scanner" --rules "$rules" --commit "$AFTER"
+            if [ "$first" = no ]; then
+              target="$BEFORE..$AFTER"
+            elif [ "$on_default" = yes ]; then
+              echo "check-integrity: nothing to scan on this push to the default branch ($DEFAULT_BRANCH): the repository's first push, or the old tip is not in this clone (a force push)"
+              exit 0
+            elif base=$(git merge-base "origin/$DEFAULT_BRANCH" "$AFTER" 2>/dev/null); then
+              # A new branch or a force push brings every commit the branch has beyond the
+              # default branch, not only the tip.
+              target="$base..$AFTER"
             else
-              python3 -B "$scanner" --rules "$rules" --range "$BEFORE..$AFTER"
+              echo "check-integrity: $AFTER has no common history with origin/$DEFAULT_BRANCH, so only the top commit is scanned"
+              mode=--commit
+              target="$AFTER"
             fi
           fi
+          if git cat-file -e "$judge:tools/check_integrity.py" 2>/dev/null; then
+            # On a pull request and on a push the scanner, its rules and the repository's
+            # .check-integrity.json come from the baseline (the base branch, the default
+            # branch, or the old tip of a push to the default branch), so a change cannot
+            # loosen the checks it is judged by.
+            git show "$judge:tools/check_integrity.py" > "$RUNNER_TEMP/check_integrity.py"
+            git show "$judge:tools/check_integrity_rules.json" > "$RUNNER_TEMP/check_integrity_rules.json"
+            scanner="$RUNNER_TEMP/check_integrity.py"
+            rules="$RUNNER_TEMP/check_integrity_rules.json"
+            if ! grep -q -- '--no-overlay' "$scanner"; then
+              :  # an older scanner on the baseline knows no overlay file
+            elif git cat-file -e "$judge:.check-integrity.json" 2>/dev/null; then
+              git show "$judge:.check-integrity.json" > "$RUNNER_TEMP/check-integrity-overlay.json"
+              overlay="--overlay $RUNNER_TEMP/check-integrity-overlay.json"
+            else
+              overlay="--no-overlay"
+            fi
+          fi
+          # Otherwise the baseline has no scanner yet: this is the change that first adds it,
+          # so it is judged by its own copy. Read it before merging.
+          code=0
+          python3 -B "$scanner" --rules "$rules" $overlay "$mode" "$target" || code=$?
+          if [ "$on_default" = yes ] && [ "$code" = 1 ]; then
+            echo "::warning::check-integrity: unjustified changes landed on $DEFAULT_BRANCH (see the scan above); a squash merge can drop the Check-change line, so confirm the change was intended"
+            exit 0
+          fi
+          exit "$code"

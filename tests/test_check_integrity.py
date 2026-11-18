@@ -1699,8 +1699,10 @@ class PushBaseline(RepoCase):
 
 class CiScanStep(unittest.TestCase):
     """The check-integrity step of .github/workflows/ci.yml, run as the shell script it is, in a
-    throwaway repository: a push to the default branch is skipped, any other push and every pull
-    request is scanned."""
+    throwaway repository. Pull requests and pushes are judged by the scanner, rules and overlay of
+    the baseline (the base branch, the default branch, or the old tip of a push to the default
+    branch), never by the ones the judged commits bring along. A push to the default branch has
+    already landed: findings there are a warning, a scanner error still fails."""
 
     ROOT = Path(__file__).resolve().parent.parent
 
@@ -1743,7 +1745,7 @@ class CiScanStep(unittest.TestCase):
         }
         values.update(variables)
         done = subprocess.run(
-            ["bash", "-e", "-c", self.step_script()],
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", self.step_script()],
             cwd=self.repo.root,
             env={**self.repo.env, **values},
             capture_output=True,
@@ -1752,11 +1754,85 @@ class CiScanStep(unittest.TestCase):
         )
         return done.returncode, done.stdout + done.stderr
 
-    def test_a_push_to_the_default_branch_is_skipped_with_a_reason(self):
+    ZERO = "0" * 40
+    UNKNOWN = "1" * 40  # a well-formed old tip that is not in the clone: a force push
+    DEFAULT_PUSH = "a push to the default branch"
+    OVERLAY = ".check-integrity.json"
+
+    def seed_baseline(self, base):
+        """Put origin/main, the baseline of pull requests and branch pushes, at base."""
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+
+    def feature(self, *prelude, base=None):
+        """A branch off base: the prelude commits (each with a reason line, so only the next
+        commit is unjustified), a commit that parks a test with no reason, a harmless one on top.
+        Returns the sha of the parking commit and the tip."""
+        self.repo.git("checkout", "-q", "-b", "feature", base or self.base_sha)
+        for message, files in prelude:
+            self.repo.commit(f"{message}\n\n{REASON}", **files)
+        park = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        tip = self.repo.commit("Add a note", notes_txt="x\n")
+        return park, tip
+
+    def entries(self, tip, base):
+        """The ways the commits up to tip reach the step, each as (where origin/main is, the step's
+        variables), with base as the baseline: what origin/main is, and for the push to the default
+        branch the old tip. Once that push has landed origin/main is the new tip."""
+        return {
+            "a pull request": (base, dict(BASE_REF="main", PR_HEAD=tip, REF="refs/pull/7/merge", BEFORE="", AFTER=tip)),
+            "the first push of a branch": (base, dict(REF="refs/heads/feature", BEFORE=self.ZERO, AFTER=tip)),
+            "a force push": (base, dict(REF="refs/heads/feature", BEFORE=self.UNKNOWN, AFTER=tip)),
+            "an ordinary push": (base, dict(REF="refs/heads/feature", BEFORE=base, AFTER=tip)),
+            self.DEFAULT_PUSH: (tip, dict(REF="refs/heads/main", BEFORE=base, AFTER=tip)),
+        }
+
+    def outcome(self, kind, origin_main, variables):
+        """"blocked" when the scanner found an unjustified change (exit 1, or on a push to the default
+        branch exit 0 with a warning), "passed" when it found none, else the raw exit code."""
+        self.seed_baseline(origin_main)
+        code, out = self.run_step(**variables)
+        warned = "::warning::" in out
+        if kind == self.DEFAULT_PUSH and code == 0 and warned:
+            return "blocked", out
+        if kind != self.DEFAULT_PUSH and code == 1 and not warned:
+            return "blocked", out
+        if code == 0 and not warned:
+            return "passed", out
+        return f"exit {code}, warning {warned}", out
+
+    def assert_blocked_everywhere(self, tip, base):
+        for kind, (origin_main, variables) in self.entries(tip, base).items():
+            with self.subTest(kind):
+                result, out = self.outcome(kind, origin_main, variables)
+                self.assertEqual(result, "blocked", out)
+                self.assertIn("skip-added", out)
+
+    def test_a_push_to_the_default_branch_reports_findings_as_a_warning_and_passes(self):
         code, out = self.run_step()
         self.assertEqual(code, 0, out)
-        self.assertIn("default branch", out)
-        self.assertNotIn("skip-added", out)
+        self.assertIn("skip-added", out)
+        self.assertIn("::warning::", out)
+
+    def test_a_clean_push_to_the_default_branch_prints_no_warning(self):
+        tip = self.repo.commit("Add a note", notes_txt="x\n")
+        code, out = self.run_step(BEFORE=self.bad, AFTER=tip)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("::warning::", out)
+        self.assertIn("check-integrity: ok (1 commits, 1 files)", out)
+
+    def test_a_scanner_error_on_the_default_branch_still_fails_the_step(self):
+        code, out = self.run_step(AFTER="f" * 40)
+        self.assertEqual(code, 2, out)
+        self.assertNotIn("::warning::", out)
+
+    def test_the_first_push_to_the_default_branch_has_nothing_to_scan(self):
+        for label, before in (("first push", self.ZERO), ("force push", self.UNKNOWN)):
+            with self.subTest(label):
+                code, out = self.run_step(BEFORE=before)
+                self.assertEqual(code, 0, out)
+                self.assertNotIn("skip-added", out)
+                self.assertNotIn("::warning::", out)
+                self.assertIn("check-integrity:", out)
 
     def test_a_push_to_another_branch_is_scanned(self):
         code, out = self.run_step(REF="refs/heads/feature")
@@ -1768,6 +1844,7 @@ class CiScanStep(unittest.TestCase):
         self.assertEqual(code, 1, "main is an ordinary branch here:\n" + out)
         code, out = self.run_step(DEFAULT_BRANCH="trunk", REF="refs/heads/trunk")
         self.assertEqual(code, 0, out)
+        self.assertIn("::warning::", out)
 
     def test_a_pull_request_is_scanned_even_when_it_targets_the_default_branch(self):
         code, out = self.run_step(BASE_REF="main", PR_HEAD=self.bad, REF="refs/pull/7/merge")
@@ -1775,8 +1852,79 @@ class CiScanStep(unittest.TestCase):
         self.assertIn("skip-added", out)
 
     def test_the_first_push_of_a_branch_is_scanned_too(self):
-        code, out = self.run_step(REF="refs/heads/feature", BEFORE="0" * 40)
+        code, out = self.run_step(REF="refs/heads/feature", BEFORE=self.ZERO)
         self.assertEqual(code, 1, out)
+
+    def test_every_commit_of_the_range_is_scanned_not_only_the_tip(self):
+        _, tip = self.feature()
+        self.assert_blocked_everywhere(tip, self.base_sha)
+
+    def test_the_first_push_of_a_branch_and_a_force_push_scan_from_the_fork_point(self):
+        park, tip = self.feature()
+        self.seed_baseline(self.base_sha)
+        for label, before in (("first push", self.ZERO), ("force push", self.UNKNOWN)):
+            with self.subTest(label):
+                code, out = self.run_step(REF="refs/heads/feature", BEFORE=before, AFTER=tip)
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{park[:7]} tests/test_thing.py", out)
+                self.assertIn("(2 commits", out)
+
+    def test_an_ordinary_push_scans_only_the_commits_it_adds(self):
+        park, tip = self.feature()
+        self.seed_baseline(self.base_sha)
+        code, out = self.run_step(REF="refs/heads/feature", BEFORE=park, AFTER=tip)
+        self.assertEqual(code, 0, out)
+        self.assertIn("(1 commits", out)
+
+    def test_a_branch_with_no_history_in_common_with_the_default_branch_scans_its_tip_and_says_why(self):
+        self.repo.git("checkout", "-q", "--orphan", "island")
+        self.repo.commit("Start over", tests__test_thing_py=BASE_TEST)
+        tip = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        self.seed_baseline(self.base_sha)
+        code, out = self.run_step(REF="refs/heads/island", BEFORE=self.ZERO, AFTER=tip)
+        self.assertEqual(code, 1, out)
+        self.assertIn("skip-added", out)
+        self.assertIn("only the top commit", out)
+
+    def test_the_scanner_comes_from_the_baseline(self):
+        _, tip = self.feature(("Replace the scanner", {"tools/check_integrity.py": "import sys\nsys.exit(0)\n"}))
+        self.assert_blocked_everywhere(tip, self.base_sha)
+
+    def test_the_rules_come_from_the_baseline(self):
+        rules = json.loads((self.ROOT / "tools" / "check_integrity_rules.json").read_text(encoding="utf-8"))
+        for rule in rules["rules"]:
+            if rule["id"] == "skip-added":
+                rule["severity"] = "note"
+        _, tip = self.feature(("Relax the rules", {"tools/check_integrity_rules.json": json.dumps(rules)}))
+        self.assert_blocked_everywhere(tip, self.base_sha)
+
+    def test_an_overlay_the_commits_bring_is_not_applied(self):
+        relaxed = json.dumps({"version": 1, "rules": {"skip-added": {"severity": "note"}}})
+        _, tip = self.feature(("Relax the rules", {self.OVERLAY: relaxed}))
+        self.assert_blocked_everywhere(tip, self.base_sha)
+
+    def test_the_overlay_of_the_baseline_is_applied(self):
+        relaxed = json.dumps({"version": 1, "rules": {"skip-added": {"severity": "note"}}})
+        self.repo.git("checkout", "-q", "-b", "trunk", self.base_sha)
+        trunk = self.repo.commit(f"Relax the rules\n\n{REASON}", **{self.OVERLAY: relaxed})
+        _, tip = self.feature(("Drop the overlay", {self.OVERLAY: None}), base=trunk)
+        for kind, (origin_main, variables) in self.entries(tip, trunk).items():
+            with self.subTest(kind):
+                result, out = self.outcome(kind, origin_main, variables)
+                self.assertEqual(result, "passed", out)
+                self.assertIn("skip-added note", out)
+
+    def test_a_baseline_without_a_scanner_leaves_the_commits_to_their_own(self):
+        self.repo.git("checkout", "-q", "-b", "bare", self.base_sha)
+        bare = self.repo.commit(
+            "Remove the scanner", **{"tools/check_integrity.py": None, "tools/check_integrity_rules.json": None}
+        )
+        scanner = {
+            f"tools/{name}": (self.ROOT / "tools" / name).read_bytes()
+            for name in ("check_integrity.py", "check_integrity_rules.json")
+        }
+        _, tip = self.feature(("Add the scanner", scanner), base=bare)
+        self.assert_blocked_everywhere(tip, bare)
 
 
 class PushRefs(RepoCase):
