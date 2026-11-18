@@ -205,14 +205,16 @@ new list in the rules file:
 - `test-removed` also reports, once, a test file renamed from a name the test runners collect
   (`test_*.py`, `*_test.py`, `x.test.*` and `x.spec.*` of JavaScript and TypeScript, `*_test.go`)
   to a name they do not, such as `tests/x_cases.py`: the tests are still on disk and no longer
-  run. The source of the old name spares it, as for a deletion.
+  run. When the source file the old name tests is deleted in the same commit, the rename passes,
+  as a deletion would.
 - `skip-added` also reports a new condition that is always false in an existing test file
   (`if False:`, `if 0:`, `if (false) {`, `if false {`): what it guards never runs. A moved line is
   not new.
-- A flag that makes a runner collect without running (`--co`, `--collect-only`,
-  `--passWithNoTests`, `--exit-zero`) on an added line of a hook or CI file or of a script is
-  reported by `bypass-added`, and on an added line of a lint or test configuration by
-  `check-file-weakened`: the run is told to pass without running the tests.
+- A flag that lets a step pass without checking anything is reported by `bypass-added` on an
+  added line of a hook or CI file or of a script, and by `check-file-weakened` on an added line
+  of a lint or test configuration. The flags are `--co` and `--collect-only` (pytest lists the
+  tests and runs none), `--passWithNoTests` (the runner passes when it finds no test file) and
+  `--exit-zero` (a linter exits 0 whatever it found).
 - `guard_lines` in the rules file lists the lines that set a floor (`fail_under`, `fail-under`,
   `--cov-fail-under`, `coverageThreshold`). A floor line rewritten in place is reported by
   `check-file-weakened` when the new text differs at all, even when every word is kept (`90`

@@ -127,8 +127,9 @@ coverage、eslint、biome、clippy、deny、golangci、shellcheck、stylelint、
   同一提交里也被删时，和删除一样放行。
 - `skip-added` 还会报现有测试文件里新增的恒假条件（`if False:`、`if 0:`、`if (false) {`、`if false {`）：它守着的代码永远不会跑。
   只是挪了位置的行不算新增。
-- 让运行器只收集不运行的参数（`--co`、`--collect-only`、`--passWithNoTests`、`--exit-zero`）出现在钩子、CI 文件或脚本的新增行里，
-  报 `bypass-added`；出现在 lint 或测试配置的新增行里，报 `check-file-weakened`：这一步被告知不跑测试也算通过。
+- 让一步什么都没查也算通过的参数，出现在钩子、CI 文件或脚本的新增行里，报 `bypass-added`；出现在 lint 或测试配置的新增行里，
+  报 `check-file-weakened`。这些参数是 `--co` 和 `--collect-only`（pytest 只列出测试，一个都不跑）、`--passWithNoTests`
+  （运行器找不到测试文件也算通过）、`--exit-zero`（linter 不管查出什么都以 0 退出）。
 - 规则表里的 `guard_lines` 列出设下限的行（`fail_under`、`fail-under`、`--cov-fail-under`、`coverageThreshold`）。这样的行被原地改写，
   新文本和旧文本只要有任何不同，`check-file-weakened` 就报，哪怕每个词都还在（`90` 改成 `.90`）。调高下限也报，也要理由行。
 
