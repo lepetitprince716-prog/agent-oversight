@@ -127,7 +127,7 @@ BASE_TEST = (
     "\n"
     "class TestThing(unittest.TestCase):\n"
     "    def test_one(self):\n"
-    "        self.assertEqual(1, 1)\n"
+    "        self.assertEqual(f(), 1)\n"
     "\n"
     "    def test_two(self):\n"
     "        assert 2 == 2\n"
@@ -314,8 +314,8 @@ class AssertionLoss(RepoCase):
     def test_rewritten_or_added_assertions_are_green(self):
         self.repo.commit(tests__test_thing_py=BASE_TEST)
         self.repo.commit(
-            tests__test_thing_py=BASE_TEST.replace("assert 2 == 2", "self.assertEqual(2, 2)")
-            + "        self.assertTrue(True)\n"
+            tests__test_thing_py=BASE_TEST.replace("assert 2 == 2", "self.assertEqual(len('ab'), 2)")
+            + "        self.assertIn(2, [2])\n"
         )
         code, out, _ = self.repo.scan("--commit", "HEAD")
         self.assertEqual(code, 0, out)
@@ -334,6 +334,202 @@ class AssertionLoss(RepoCase):
         self.assertIn(("pkg/a_test.go", "assertion-loss"), found)
 
 
+SHORT_CIRCUIT_RULE = "test-short-circuited"
+DETACHED_RULE = "test-class-detached"
+TAUTOLOGY_RULE = "tautology-added"
+
+
+class ShortCircuitedTest(RepoCase):
+    """A bare return in a test body ends the test before its assertions; the test still passes."""
+
+    def commit_edit(self, path, base, anchor, line):
+        self.repo.commit(**{path.replace("/", "__"): base})
+        self.repo.commit(**{path.replace("/", "__"): base.replace(anchor, anchor + line, 1)})
+
+    def test_a_bare_return_added_to_an_existing_test_is_red_in_each_language(self):
+        cases = {
+            "python return": ("tests/test_a.py", BASE_TEST, "    def test_one(self):\n", "        return\n", 5),
+            "python return None": ("tests/test_a.py", BASE_TEST, "    def test_one(self):\n", "        return None\n", 5),
+            "python return with a comment": ("tests/test_a.py", BASE_TEST, "    def test_one(self):\n", "        return  # later\n", 5),
+            "js": ("web/a.test.ts", "it('one', () => {\n  expect(f()).toBe(1)\n})\n", "it('one', () => {\n", "  return;\n", 2),
+            "rust": ("crate/tests/a.rs", "#[test]\nfn a() {\n    assert_eq!(f(), 1);\n}\n", "fn a() {\n", "    return;\n", 3),
+            "go": ("pkg/a_test.go", "func TestA(t *testing.T) {\n\tt.Fatal(f())\n}\n", "func TestA(t *testing.T) {\n", "\treturn\n", 2),
+        }
+        for name, (path, base, anchor, line, number) in cases.items():
+            with self.subTest(name):
+                self.commit_edit(path, base, anchor, line)
+                self.assertEqual(self.rules_at_head(), {(path, number, SHORT_CIRCUIT_RULE, False)})
+
+    def test_a_return_with_a_value_and_a_return_outside_the_test_files_are_green(self):
+        self.repo.commit(tests__test_a_py=BASE_TEST, src__a_py="def f():\n    pass\n")
+        self.repo.commit(
+            tests__test_a_py=BASE_TEST.replace("    def test_two(self):\n", "    def helper(self):\n        return 1\n\n    def test_two(self):\n"),
+            src__a_py="def f():\n    return\n",
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_return_that_only_moves_inside_its_file_is_green(self):
+        before = "def check(x):\n    if x:\n        return\n    use(x)\n"
+        after = "def check(x):\n    use(x)\n    if not x:\n        note(x)\n    return\n"
+        self.repo.commit(tests__test_a_py=BASE_TEST + "\n" + before)
+        self.repo.commit(tests__test_a_py=BASE_TEST + "\n" + after)
+        _, report = self.head_json()
+        self.assertEqual(report["findings"], [])
+
+    def test_a_reason_line_passes_it(self):
+        self.repo.commit(tests__test_a_py=BASE_TEST)
+        self.repo.commit(
+            f"Park a test\n\n{REASON}",
+            tests__test_a_py=BASE_TEST.replace("    def test_one(self):\n", "    def test_one(self):\n        return\n"),
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+
+DETACHABLE = (
+    "import unittest\n"
+    "\n"
+    "class TestOne(unittest.TestCase):\n"
+    "    def test_a(self):\n"
+    "        self.assertEqual(f(), 1)\n"
+    "\n"
+    "class TestTwo(Mixin, unittest.IsolatedAsyncioTestCase):\n"
+    "    async def test_b(self):\n"
+    "        self.assertEqual(f(), 2)\n"
+)
+
+
+class DetachedTestClass(RepoCase):
+    """Without its TestCase base, or gone altogether, a class is no longer collected by unittest
+    and its tests stop running without a test being deleted."""
+
+    def test_a_class_that_loses_its_testcase_base_or_goes_away_is_red(self):
+        cases = {
+            "base dropped": ("class TestOne(unittest.TestCase):\n", "class TestOne:\n", 3),
+            "base replaced by object": ("class TestOne(unittest.TestCase):\n", "class TestOne(object):\n", 3),
+            "async base dropped from a class with a mixin": (
+                "class TestTwo(Mixin, unittest.IsolatedAsyncioTestCase):\n",
+                "class TestTwo(Mixin):\n",
+                7,
+            ),
+            "base made a comment": ("class TestOne(unittest.TestCase):\n", "# class TestOne(unittest.TestCase):\n", 3),
+        }
+        for name, (old, new, number) in cases.items():
+            with self.subTest(name):
+                self.repo.commit(tests__test_a_py=DETACHABLE)
+                self.repo.commit(tests__test_a_py=DETACHABLE.replace(old, new))
+                self.assertEqual(self.rules_at_head(), {("tests/test_a.py", number, DETACHED_RULE, False)})
+
+    def test_a_deleted_class_is_red_even_when_its_tests_move_into_another_class(self):
+        self.repo.commit(tests__test_a_py=DETACHABLE)
+        self.repo.commit(
+            tests__test_a_py=DETACHABLE.split("class TestTwo")[0]
+            + "    def test_b(self):\n        self.assertEqual(f(), 2)\n"
+        )
+        self.assertEqual(self.rules_at_head(), {("tests/test_a.py", 7, DETACHED_RULE, False)})
+
+    def test_a_renamed_class_a_wider_base_list_and_a_class_moved_to_another_file_are_green(self):
+        self.repo.commit(tests__test_a_py=DETACHABLE)
+        self.repo.commit(tests__test_a_py=DETACHABLE.replace("class TestOne(", "class TestUno("))
+        self.repo.commit(tests__test_a_py=DETACHABLE.replace("(unittest.TestCase)", "(Mixin, unittest.TestCase)"))
+        code, out, _ = self.repo.scan("--range", "HEAD~2..HEAD")
+        self.assertEqual(code, 0, out)
+        first, second = DETACHABLE.split("class TestTwo")
+        self.repo.commit(tests__test_a_py=first, tests__test_b_py="import unittest\n\nclass TestTwo" + second)
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_reason_line_passes_it(self):
+        self.repo.commit(tests__test_a_py=DETACHABLE)
+        self.repo.commit(f"Drop the base\n\n{REASON}", tests__test_a_py=DETACHABLE.replace("(unittest.TestCase)", ""))
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+
+class TautologyAdded(RepoCase):
+    """An assertion that cannot fail, added to a test file, replaces one that could."""
+
+    RED = {
+        "assertTrue(True)": ("tests/test_a.py", "        self.assertTrue(True)\n"),
+        "assertTrue(True, msg)": ("tests/test_a.py", "        self.assertTrue(True, 'always')\n"),
+        "assertFalse(False)": ("tests/test_a.py", "        self.assertFalse(False)\n"),
+        "assert True": ("tests/test_a.py", "        assert True\n"),
+        "assert True with a message": ("tests/test_a.py", "        assert True, 'fine'\n"),
+        "assertEqual of one name": ("tests/test_a.py", "        self.assertEqual(result, result)\n"),
+        "assertEqual of one attribute": ("tests/test_a.py", "        self.assertEqual(self.x, self.x)\n"),
+        "assertEqual of one number": ("tests/test_a.py", "        self.assertEqual(2, 2)\n"),
+        "assertEqual of one string": ("tests/test_a.py", "        self.assertEqual('a', 'a', 'same')\n"),
+        "assertIs None None": ("tests/test_a.py", "        self.assertIs(None, None)\n"),
+        "js expect true": ("web/a.test.ts", "  expect(true).toBe(true)\n"),
+        "js expect same string": ("web/a.test.ts", "  expect('a').toEqual('a')\n"),
+        "rust assert true": ("crate/tests/a.rs", "    assert!(true);\n"),
+        "rust assert true with a message": ("crate/tests/a.rs", "    assert!(true, \"ok\");\n"),
+    }
+    GREEN = {
+        "assertTrue of a value": "        self.assertTrue(flag)\n",
+        "assertTrue of a longer expression": "        self.assertTrue(True and flag)\n",
+        "assertEqual of two names": "        self.assertEqual(result, expected)\n",
+        "assertEqual of a name and its attribute": "        self.assertEqual(result, result.value)\n",
+        "assertEqual of near names": "        self.assertEqual(a, a1)\n",
+        "assertEqual of two numbers": "        self.assertEqual(2, 3)\n",
+        "assertIs of None and a value": "        self.assertIs(found, None)\n",
+        "assert of a comparison": "        assert x == x2\n",
+        "assert of a name starting with True": "        assert Truthy\n",
+    }
+    HOST = {
+        "tests/test_a.py": (BASE_TEST, "    def test_one(self):\n"),
+        "web/a.test.ts": ("it('one', () => {\n  expect(f()).toBe(1)\n})\n", "it('one', () => {\n"),
+        "crate/tests/a.rs": ("#[test]\nfn a() {\n    assert_eq!(f(), 1);\n}\n", "fn a() {\n"),
+    }
+
+    def add(self, path, line):
+        base, anchor = self.HOST[path]
+        name = path.replace("/", "__")
+        self.repo.commit(**{name: base})
+        self.repo.commit(**{name: base.replace(anchor, anchor + line, 1)})
+
+    def test_each_assertion_that_cannot_fail_is_red(self):
+        for name, (path, line) in self.RED.items():
+            with self.subTest(name):
+                self.add(path, line)
+                found = self.rules_at_head()
+                self.assertEqual({(p, rule) for p, _, rule, _ in found}, {(path, TAUTOLOGY_RULE)}, found)
+
+    def test_assertions_that_can_fail_are_green(self):
+        for name, line in self.GREEN.items():
+            with self.subTest(name):
+                self.add("tests/test_a.py", line)
+                self.assertEqual(self.rules_at_head(), set())
+
+    def test_a_real_assertion_swapped_for_one_that_cannot_fail_is_red(self):
+        self.repo.commit(tests__test_a_py=BASE_TEST)
+        self.repo.commit(tests__test_a_py=BASE_TEST.replace("self.assertEqual(f(), 1)", "self.assertTrue(True)"))
+        self.assertEqual({(p, rule) for p, _, rule, _ in self.rules_at_head()}, {("tests/test_a.py", TAUTOLOGY_RULE)})
+
+    def test_one_that_is_only_moved_inside_its_file_is_green(self):
+        base = BASE_TEST.replace("        assert 2 == 2\n", "        assert 2 == 2\n        self.assertTrue(True)\n")
+        moved = base.replace("        self.assertTrue(True)\n", "").replace(
+            "        self.assertEqual(f(), 1)\n", "        self.assertEqual(f(), 1)\n        self.assertTrue(True)\n"
+        )
+        self.repo.commit(tests__test_a_py=base)
+        self.repo.commit(tests__test_a_py=moved)
+        self.assertEqual(self.rules_at_head(), set())
+
+    def test_a_new_test_file_is_judged_too_and_a_source_file_is_not(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(tests__test_new_py="def test_x():\n    assert True\n", src__a_py="assert True\n")
+        self.assertEqual(self.rules_at_head(), {("tests/test_new.py", 2, TAUTOLOGY_RULE, False)})
+
+    def test_a_reason_line_passes_it(self):
+        self.repo.commit(tests__test_a_py=BASE_TEST)
+        self.repo.commit(
+            f"Stub a test\n\n{REASON}", tests__test_a_py=BASE_TEST + "\n    def test_three(self):\n        assert True\n"
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+
 WORKFLOW = "# CI\njobs:\n  test:\n    steps:\n      - run: make lint\n      - run: make test\n"
 
 
@@ -349,7 +545,7 @@ class CheckFileWeakened(RepoCase):
             },
         )
 
-    def test_removed_step_is_red_comment_and_addition_are_green(self):
+    def test_removed_step_is_weakened_but_comment_and_addition_only_change_the_machinery(self):
         self.repo.commit(_github__workflows__ci_yml=WORKFLOW)
         self.repo.commit(_github__workflows__ci_yml=WORKFLOW.replace("      - run: make lint\n", ""))
         self.assertEqual(
@@ -559,7 +755,7 @@ class MergeCommits(RepoCase):
 
     def conflicting_sides(self, path="tests__test_s_py", text=BASE_TEST):
         """Two branches that change the same line of one file differently."""
-        line = "        self.assertEqual(1, 1)\n"
+        line = "        self.assertEqual(f(), 1)\n"
         self.branch_off()
         self.repo.commit("Side", **{path: text.replace(line, line.rstrip() + "  # side\n")})
         self.repo.git("checkout", "-q", "main")
@@ -591,8 +787,8 @@ class MergeCommits(RepoCase):
     def test_a_skip_added_while_resolving_a_conflict_is_reported_on_the_merge(self):
         self.conflicting_sides()
         resolved = skipped(BASE_TEST).replace(
-            "        self.assertEqual(1, 1)\n",
-            "        self.assertEqual(1, 1)  # side\n        self.assertEqual(1, 1)  # main\n",
+            "        self.assertEqual(f(), 1)\n",
+            "        self.assertEqual(f(), 1)  # side\n        self.assertEqual(f(), 1)  # main\n",
         )
         merge = self.merge(tests__test_s_py=resolved)
         code, report = self.head_json()
@@ -706,7 +902,7 @@ class StagedMerge(RepoCase):
         self.assertEqual((code, out.strip()), (0, "check-integrity: ok (staged, 0 files)"), err)
 
     def test_a_skip_added_while_resolving_a_conflict_is_a_finding_and_a_reason_line_clears_it(self):
-        line = "        self.assertEqual(1, 1)\n"
+        line = "        self.assertEqual(f(), 1)\n"
         self.side(tests__test_s_py=BASE_TEST.replace(line, line.rstrip() + "  # side\n"))
         self.repo.commit("Main", tests__test_s_py=BASE_TEST.replace(line, line.rstrip() + "  # main\n"))
         self.start_merge("side")
@@ -994,7 +1190,7 @@ class NarrowedRules(RepoCase):
 
     # check-file-weakened: a line rewritten in place counts only if it drops a word
 
-    def test_reworded_or_widened_check_lines_are_green(self):
+    def test_reworded_or_widened_check_lines_are_not_weakened_but_still_change_the_machinery(self):
         self.repo.commit(
             tools__privacy_rules_json='{"why": "a private address"}\n',
             _github__workflows__ci_yml="jobs:\n  gate:\n    needs: [lint, test]\n",
@@ -1007,7 +1203,10 @@ class NarrowedRules(RepoCase):
         )
         self.assertEqual(
             {(path, rule) for path, _, rule, _ in self.rules_at_head()},
-            {(".github/workflows/ci.yml", "check-machinery-changed")},
+            {
+                (".github/workflows/ci.yml", "check-machinery-changed"),
+                ("tools/privacy_rules.json", "check-machinery-changed"),
+            },
         )
 
     def test_narrowed_check_lines_are_red(self):
@@ -1306,7 +1505,7 @@ class Overlay(RepoCase):
         self.assertIn("tests/test_other.py:4 skip-added", out)
         # the file stays under every other rule
         self.repo.commit(tests__test_thing_py="import unittest\n")
-        self.assertEqual(self.rule_names(), {"test-removed", "assertion-loss"})
+        self.assertEqual(self.rule_names(), {"test-removed", "assertion-loss", "test-class-detached"})
 
     def test_exempt_paths_are_globs_and_a_rename_needs_both_paths_to_match(self):
         self.repo.commit(tests__test_other_py=BASE_TEST)
@@ -1329,6 +1528,7 @@ class Overlay(RepoCase):
                 "rules": {
                     "test-removed": {"exempt_paths": ["tests/test_thing.py"]},
                     "assertion-loss": {"exempt_paths": ["tests/test_thing.py"]},
+                    "test-class-detached": {"exempt_paths": ["tests/test_thing.py"]},
                 },
             }
         )
@@ -1339,7 +1539,7 @@ class Overlay(RepoCase):
         self.assertEqual(self.rules_at_head(), set())
         self.repo.commit(tests__test_other_py=BASE_TEST)
         self.repo.commit(tests__test_other_py="import unittest\n")
-        self.assertEqual(self.rule_names(), {"test-removed", "assertion-loss"})
+        self.assertEqual(self.rule_names(), {"test-removed", "assertion-loss", "test-class-detached"})
 
     def test_overlay_is_found_from_a_subfolder_of_the_repository(self):
         self.overlay({"rules": {"skip-added": {"severity": "note"}}})
@@ -2584,6 +2784,8 @@ MACHINERY = {
     ".gitlab-ci.yml": "test:\n  script: make test\n",
     "tools/check_integrity.py": "def judge_change(diffs, rules):\n    return []\n",
     "tools/check_integrity_rules.json": '{"version": 1}\n',
+    "tools/privacy_scan.py": "RULES = 1\n",
+    "tools/privacy_rules.json": '{"rules": []}\n',
 }
 MACHINERY_RULE = "check-machinery-changed"
 LOOSEN_RULE = "check-file-weakened"
@@ -2773,7 +2975,12 @@ class MachineryChanged(RepoCase):
     def test_the_default_table_ties_the_machinery_to_the_hook_and_ci_classes_and_the_scanner(self):
         rules = ci.load_rules(RULES)
         patterns = lambda name: {p.pattern for p in rules.classes[name]}
-        scanner = {r"(^|/)tools/check_integrity\.py$", r"(^|/)tools/check_integrity_rules\.json$"}
+        scanner = {
+            r"(^|/)tools/check_integrity\.py$",
+            r"(^|/)tools/check_integrity_rules\.json$",
+            r"(^|/)tools/privacy_scan\.py$",
+            r"(^|/)tools/privacy_rules\.json$",
+        }
         self.assertEqual(patterns("machinery"), patterns("bypass") | scanner)
         rule = next(r for r in rules.rules if r.id == MACHINERY_RULE)
         self.assertEqual((rule.kind, rule.severity, rule.classes), ("changed", "block", ("machinery",)))
@@ -2810,6 +3017,19 @@ class LintConfigLoosened(RepoCase):
                 self.put(f"Loosen {name}", name, loosened if loosened.startswith("{") else base + loosened)
                 found = {(path, rule) for path, _, rule, _ in self.rules_at_head()}
                 self.assertIn((name, LOOSEN_RULE), found)
+
+    def test_a_loosening_key_with_a_hyphen_is_a_finding(self):
+        cases = {
+            ".golangci.yml": ("run:\n  timeout: 5m\n", ["  skip-dirs: [vendor]\n", "  exclude-dirs: [vendor]\n", "  skip-files: [gen.go]\n"]),
+            ".pylintrc": ("[MASTER]\njobs = 1\n", ["ignore-paths = ^tests/\n", "ignore-patterns = test_\n"]),
+        }
+        for name, (base, lines) in cases.items():
+            for line in lines:
+                with self.subTest(name=name, line=line):
+                    self.put(f"Add {name}", name, base)
+                    self.put(f"Loosen {name}", name, base + line)
+                    found = {(path, rule) for path, _, rule, _ in self.rules_at_head()}
+                    self.assertIn((name, LOOSEN_RULE), found)
 
     def test_a_new_config_file_is_not_a_loosening(self):
         self.repo.commit(ruff_toml='ignore = ["E"]\n')
@@ -2930,6 +3150,30 @@ class VersionBumps(RepoCase):
                 code, found = self.findings()
                 self.assertEqual((code, [(p, r, s) for p, _, r, s, _ in found]), (0, [(path, VERSION_RULE, "note")]))
                 self.put("Back", **{path: base})
+
+    def test_the_version_key_of_each_runtime_and_toolchain_bumped_is_a_note(self):
+        names = "python node go java ruby bun deno dotnet php pnpm uv rust gradle elixir otp terraform".split()
+        for name in names:
+            with self.subTest(name):
+                base = VERSIONED_WORKFLOW + f"        {name}-version: '1.2'\n"
+                self.put("Add the key", **{WORKFLOW_PATH: base})
+                self.put("Bump", **{WORKFLOW_PATH: base.replace("'1.2'", "'1.3'")})
+                code, found = self.findings()
+                self.assertEqual((code, [(p, r, s) for p, _, r, s, _ in found]), (0, [(WORKFLOW_PATH, VERSION_RULE, "note")]))
+                self.put("Back", **{WORKFLOW_PATH: VERSIONED_WORKFLOW})
+
+    def test_any_other_key_ending_in_version_changed_stays_blocking(self):
+        for key in ("min-tls-version", "api-version", "protocol-version", "ssl-version", "xpython-version"):
+            with self.subTest(key):
+                base = VERSIONED_WORKFLOW + f"        {key}: '1.3'\n"
+                self.put("Add the key", **{WORKFLOW_PATH: base})
+                self.put("Change", **{WORKFLOW_PATH: base.replace("'1.3'", "'1.0'")})
+                code, found = self.findings()
+                rules = {r for _, _, r, _, _ in found}
+                self.assertEqual(code, 1, found)
+                self.assertIn(MACHINERY_RULE, rules)
+                self.assertNotIn(VERSION_RULE, rules)
+                self.put("Back", **{WORKFLOW_PATH: VERSIONED_WORKFLOW})
 
     def test_two_files_of_bumps_give_one_note_each(self):
         self.put(

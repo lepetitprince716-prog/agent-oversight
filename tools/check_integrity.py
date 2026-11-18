@@ -23,13 +23,13 @@ A merge commit is judged by what the merge changed beyond the automatic merge (`
 (``MERGE_HEAD`` exists) the same way: the index against the automatic merge of HEAD and the
 merged commit (``git merge-tree --write-tree``, git 2.38 or newer). Conflict markers that the
 resolution removes are not findings. More than one merged commit is an ``unreadable-change``.
-The files that run the checks (hooks, CI workflows, this scanner and its rules file; class
-``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
+The files that run the checks (hooks, CI workflows, this scanner, the privacy scanner and their rules
+files; class ``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
 deleted or moved file, other permission bits or another file type is a blocking finding
 (rule ``check-machinery-changed``, one per file) next to the rules that read their lines.
 A change that only moves version numbers on version lines (``version_lines`` of the rules file: a
-tagged or pinned ``uses:``, ``runs-on``, a key ending in ``-version``, ``image``, ``container``, a
-pre-commit ``rev``) of a hook or CI file is a note, ``version-bumped``, in place of those two rules
+tagged or pinned ``uses:``, ``runs-on``, the version key of a runtime or toolchain such as
+``python-version``, ``image``, ``container``, a pre-commit ``rev``) of a hook or CI file is a note, ``version-bumped``, in place of those two rules
 (see ``bumped``); any other number, and any other change on those lines, stays as it was.
 
 Every git call pins the configuration, attributes and environment that change diff text
