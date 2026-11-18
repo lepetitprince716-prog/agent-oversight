@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern, 'removed' on a removed line, 'net-loss' when a file loses more matching lines than it gains, 'deleted' when a file of the class is deleted. A deleted file is judged by 'deleted' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. An id may appear in several entries.",
+  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'net-added' likewise, but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change. An id may appear in several entries.",
   "classes": {
     "test": [
       "(^|/)tests?/",
@@ -23,7 +23,9 @@
       "(^|/)\\.github/workflows/",
       "(^|/)\\.gitlab-ci\\.ya?ml$",
       "(^|/)\\.circleci/",
-      "(^|/)azure-pipelines\\.ya?ml$",
+      "(^|/)azure-pipelines\\.ya?ml$"
+    ],
+    "script": [
       "(^|/)scripts?/",
       "(^|/)bin/",
       "\\.(sh|bash|zsh|ps1|cmd|bat)$",
@@ -77,8 +79,10 @@
     {
       "id": "skip-added",
       "kind": "added",
-      "classes": ["test"],
-      "why": "a test is skipped, focused or expected to fail",
+      "classes": [
+        "test"
+      ],
+      "why": "a test in an existing test file is skipped, focused or expected to fail",
       "patterns": [
         "@unittest\\.(skip\\w*|expectedFailure)\\b",
         "^\\s*@(skip(If|Unless)?|expectedFailure)\\b",
@@ -86,17 +90,20 @@
         "\\bSkipTest\\b",
         "\\bpytest\\.mark\\.(skip\\w*|xfail)\\b",
         "\\bpytest\\.(skip|xfail)\\s*\\(",
-        "\\.(skip|only|todo|fails)\\b\\s*[.(`]",
+        "(?<![\\w.$])(it|test|describe|context|suite)\\.(skip|only|todo|fails)\\b\\s*[.(`]",
         "(?<![\\w.$])[xf](it|test|describe|context)\\s*\\(\\s*['\"`]",
         "#\\[ignore\\b",
         "\\b[tb]\\.Skip(f|Now)?\\s*\\("
-      ]
+      ],
+      "existing_only": true
     },
     {
       "id": "suppression-added",
-      "kind": "added",
-      "classes": ["source"],
-      "why": "a checker is told to look away",
+      "kind": "net-added",
+      "classes": [
+        "source"
+      ],
+      "why": "a checker is told to look away (net new markers per file)",
       "patterns": [
         "#\\s*type:\\s*ignore\\b",
         "#\\s*noqa\\b",
@@ -117,15 +124,17 @@
         "#\\s*shellcheck\\s+disable\\b",
         "@SuppressWarnings\\b"
       ],
-      "allow": [
-        "#\\s*noqa:\\s*E402\\b(?!\\s*,)"
+      "skip_lines": [
+        "^\\s*(from\\s+[\\w.]+\\s+)?import\\s[^#]*#\\s*noqa:\\s*(F401|E402|PLC0415)(\\s*,\\s*(F401|E402|PLC0415))*\\b(?!\\s*,)(?!.*(#|@ts-|eslint|NOLINT|nolint))"
       ]
     },
     {
       "id": "bypass-added",
       "kind": "added",
-      "classes": ["bypass"],
-      "why": "a hook, CI step or script is told to ignore failure or skip checks",
+      "classes": [
+        "bypass"
+      ],
+      "why": "a hook or CI step is told to ignore failure or skip checks",
       "patterns": [
         "--no-verify\\b",
         "\\bgit\\s+(commit|push|merge|am)\\b[^\\n]*\\s-n\\b",
@@ -142,16 +151,32 @@
       ]
     },
     {
+      "id": "bypass-added",
+      "kind": "added",
+      "classes": [
+        "script"
+      ],
+      "why": "a script swallows the failure of a check command on the same line",
+      "patterns": [
+        "^(?=.*(?<![\\w-])(pytest|unittest|ruff|mypy|pyright|eslint|tsc|biome|clippy|cargo\\s+test|(npm|pnpm|yarn)\\s+(run\\s+)?test|bun\\s+test|go\\s+(test|vet))(?![\\w-])).*\\|\\|\\s*(true\\b|:(?![\\w:])|exit\\s+0\\b)"
+      ]
+    },
+    {
       "id": "test-removed",
       "kind": "deleted",
-      "classes": ["test"],
-      "why": "a test file was deleted"
+      "classes": [
+        "test"
+      ],
+      "why": "a test file was deleted while the source it tests stays",
+      "spare_with_source": true
     },
     {
       "id": "test-removed",
       "kind": "net-loss",
-      "classes": ["test"],
-      "why": "the file lost more test definitions than it gained",
+      "classes": [
+        "test"
+      ],
+      "why": "the change lost more test definitions than it gained, over all test files",
       "patterns": [
         "^\\s*(async\\s+)?def\\s+test\\w*\\s*\\(",
         "(?<![\\w.$])(it|test)\\s*\\(",
@@ -163,8 +188,10 @@
     {
       "id": "assertion-loss",
       "kind": "net-loss",
-      "classes": ["test"],
-      "why": "the file lost more assertion lines than it gained",
+      "classes": [
+        "test"
+      ],
+      "why": "the change lost more assertion lines than it gained, over all test files",
       "patterns": [
         "^\\s*assert\\b",
         "\\bself\\.(assert|fail)\\w*\\s*\\(",
@@ -180,21 +207,31 @@
     {
       "id": "check-file-weakened",
       "kind": "deleted",
-      "classes": ["check"],
+      "classes": [
+        "check"
+      ],
       "why": "a check file (hook, CI, lint or type config, scanner) was deleted"
     },
     {
       "id": "check-file-weakened",
       "kind": "removed",
-      "classes": ["check"],
+      "classes": [
+        "check"
+      ],
       "why": "a line was removed from a check file",
-      "patterns": ["\\S"],
-      "skip_lines": ["^\\s*(#|//|;|/\\*|\\*|<!--)"]
+      "patterns": [
+        "\\S"
+      ],
+      "skip_lines": [
+        "^\\s*(#|//|;|/\\*|\\*|<!--)"
+      ]
     },
     {
       "id": "check-file-weakened",
       "kind": "removed",
-      "classes": ["mixed"],
+      "classes": [
+        "mixed"
+      ],
       "why": "a line that tightens a check was removed",
       "patterns": [
         "\\bstrict\\w*[\"']?\\s*[:=]\\s*[\"']?(true|strict|error|all)\\b",
@@ -216,13 +253,17 @@
         "\\[tool\\.(mypy|ruff|pyright|pylint|pytest|coverage|flake8|black)[\\].]",
         "\\[(lints|workspace\\.lints)[\\].]"
       ],
-      "skip_lines": ["^\\s*(#|//|;)"]
+      "skip_lines": [
+        "^\\s*(#|//|;)"
+      ]
     },
     {
       "id": "check-file-weakened",
       "kind": "added",
-      "classes": ["mixed"],
-      "why": "a line that loosens a check was added",
+      "classes": [
+        "mixed"
+      ],
+      "why": "a line that loosens a check was added to an existing config file",
       "patterns": [
         "\\bstrict\\w*[\"']?\\s*[:=]\\s*[\"']?(false|off|basic|none)\\b",
         "\\b(extend-|per-file-)?ignores?\\w*[\"']?\\s*[:=]",
@@ -242,7 +283,10 @@
         "\\sbinary\\b",
         "\\blinguist-generated\\b"
       ],
-      "skip_lines": ["^\\s*(#|//|;)"]
+      "skip_lines": [
+        "^\\s*(#|//|;)"
+      ],
+      "existing_only": true
     }
   ]
 }

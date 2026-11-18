@@ -144,7 +144,6 @@ class SkipAdded(RepoCase):
         self.assertIn("Check-change:", out.splitlines()[-1])
 
     def test_every_language_marker_is_red(self):
-        self.repo.commit(README_md="seed\n")
         samples = {
             "tests/test_a.py": "    self.skipTest('later')\n",
             "tests/test_b.py": "raise unittest.SkipTest('x')\n",
@@ -161,8 +160,11 @@ class SkipAdded(RepoCase):
             "pkg/h_test.go": "\tt.Skip(\"later\")\n",
             "pkg/i_test.go": "\tt.Skipf(\"later %d\", 1)\n",
         }
+        for path in samples:
+            self.repo.write(path, "// seed\n")
+        self.repo.commit()
         for path, line in samples.items():
-            self.repo.write(path, line)
+            self.repo.write(path, "// seed\n" + line)
         self.repo.commit()
         found = {(path, rule) for path, _, rule, _ in self.rules_at_head()}
         for path in samples:
@@ -218,7 +220,7 @@ class SuppressionAdded(RepoCase):
         self.repo.commit(README_md="seed\n")
         self.repo.commit(
             tests__test_a_py="import sys\nsys.path.insert(0, 'x')\nimport thing  # noqa: E402\n",
-            tests__test_b_py="import thing  # noqa: E402, F401\n",
+            tests__test_b_py="import thing  # noqa: E402, F811\n",
         )
         found = {(path, rule) for path, _, rule, _ in self.rules_at_head()}
         self.assertNotIn(("tests/test_a.py", "suppression-added"), found)
@@ -240,8 +242,9 @@ class BypassAdded(RepoCase):
             "scripts/check.sh": "ruff check . || :\n",
             ".github/workflows/ci.yml": "      - run: pytest\n        continue-on-error: true\n",
             ".github/workflows/lint.yml": "    if: false\n",
-            "package.json": '{"scripts": {"commit": "HUSKY=0 git commit"}}\n',
-            "bin/setup": "git config core.hooksPath /dev/null\n",
+            "package.json": '{"scripts": {"test": "npm test || true"}}\n',
+            ".husky/pre-commit": "HUSKY=0 git commit\n",
+            ".githooks/post-checkout": "git config core.hooksPath /dev/null\n",
         }
         for path, line in samples.items():
             self.repo.write(path, line)
@@ -463,7 +466,7 @@ class DiffEdgeCases(RepoCase):
         self.assertEqual(self.rules_at_head(), {("src/loop.c", 2, "suppression-added", False)})
 
     def test_space_and_non_ascii_names(self):
-        self.repo.commit(README_md="seed\n")
+        self.repo.commit(**{"tests__my tést ü.py": "def test_a():\n    assert 1\n"})
         self.repo.commit(**{"tests__my tést ü.py": "@unittest.skip('x')\ndef test_a():\n    assert 1\n"})
         code, out, _ = self.repo.scan("--commit", "HEAD")
         self.assertEqual(code, 1)
@@ -480,13 +483,12 @@ class DiffEdgeCases(RepoCase):
             self.rules_at_head(), {("tests/fixtures/img.png", 0, "test-removed", False)}
         )
 
-    def test_rename_is_delete_plus_add(self):
+    def test_rename_is_one_change_not_a_deletion(self):
         self.repo.commit(tests__test_old_py=BASE_TEST)
         self.repo.git("mv", "tests/test_old.py", "tests/test_new.py")
         self.repo.commit("Rename")
-        _, report = self.head_json()
-        self.assertEqual(report["files"], 2)
-        self.assertEqual(self.rules_at_head(), {("tests/test_old.py", 0, "test-removed", False)})
+        code, report = self.head_json()
+        self.assertEqual((code, report["files"], report["findings"]), (0, 1, []))
 
     def test_non_utf8_content_is_still_scanned(self):
         self.repo.commit(README_md="seed\n")
@@ -500,11 +502,11 @@ class DiffEdgeCases(RepoCase):
         )
 
     def test_root_commit(self):
-        self.repo.commit(tests__test_a_py="@unittest.skip('x')\ndef test_a():\n    assert 1\n")
-        self.assertEqual(self.rules_at_head(), {("tests/test_a.py", 1, "skip-added", False)})
+        self.repo.commit(src__a_py="x = f()  # type: ignore\n")
+        self.assertEqual(self.rules_at_head(), {("src/a.py", 1, "suppression-added", False)})
 
     def test_merge_commit_uses_first_parent(self):
-        self.repo.commit(README_md="seed\n", src__a_py="a = 1\n")
+        self.repo.commit(README_md="seed\n", src__a_py="a = 1\n", tests__test_s_py="def test_s():\n    assert 1\n")
         self.repo.git("checkout", "-q", "-b", "side")
         self.repo.commit(tests__test_s_py="@unittest.skip('x')\ndef test_s():\n    assert 1\n")
         self.repo.git("checkout", "-q", "main")
@@ -513,7 +515,7 @@ class DiffEdgeCases(RepoCase):
         self.assertEqual(self.rules_at_head(), {("tests/test_s.py", 1, "skip-added", False)})
 
     def test_one_line_hitting_two_rules_reports_both(self):
-        self.repo.commit(README_md="seed\n")
+        self.repo.commit(tests__test_a_py="def test_a():\n    assert 1\n")
         self.repo.commit(tests__test_a_py="@unittest.skip('x')  # noqa\ndef test_a():\n    assert 1\n")
         self.assertEqual(
             self.rules_at_head(),
@@ -593,6 +595,253 @@ class RangeAndErrors(RepoCase):
                 with self.assertRaises(ci.IntegrityError):
                     ci.load_rules(bad)
         self.assertTrue(ci.load_rules(RULES).rules)
+
+class NarrowedRules(RepoCase):
+    """Each narrowing of the rules: a case that used to be reported and no longer is, and a
+    real weakening of the same kind that is still reported."""
+
+    def findings(self):
+        return {(path, rule) for path, _, rule, _ in self.rules_at_head()}
+
+    # skip-added: only it/test/describe/context/suite count as the owner of .skip and friends
+
+    def test_helper_methods_named_fails_or_only_are_green(self):
+        self.repo.commit(tests__test_cli_py=BASE_TEST)
+        self.repo.commit(
+            tests__test_cli_py=BASE_TEST
+            + "\n    def test_three(self):\n        self.fails('usage', code=2)\n        self.only(doc, 'E1')\n"
+        )
+        self.assertNotIn("skip-added", self.rule_names())
+
+    def test_suite_and_context_skips_are_red(self):
+        self.repo.commit(**{"web/a.test.ts": "// seed\n", "web/b.test.ts": "// seed\n"})
+        self.repo.commit(
+            **{
+                "web/a.test.ts": "// seed\nsuite.skip('slow', () => {})\n",
+                "web/b.test.ts": "// seed\ncontext.only('one', () => {})\n",
+            }
+        )
+        self.assertEqual(
+            self.findings(), {("web/a.test.ts", "skip-added"), ("web/b.test.ts", "skip-added")}
+        )
+
+    # skip-added: a new test file cannot weaken a check that existed before
+
+    def test_skip_in_new_test_file_is_green(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(
+            tests__test_new_py="@unittest.skipUnless(HAS_GPU, 'needs a GPU')\ndef test_a():\n    assert 1\n"
+        )
+        self.assertNotIn("skip-added", self.rule_names())
+
+    def test_skip_added_to_existing_test_file_is_red(self):
+        self.repo.commit(tests__test_old_py="def test_a():\n    assert 1\n")
+        self.repo.commit(
+            tests__test_old_py="@unittest.skipUnless(HAS_GPU, 'needs a GPU')\ndef test_a():\n    assert 1\n"
+        )
+        self.assertEqual(self.findings(), {("tests/test_old.py", "skip-added")})
+
+    # suppression-added: F401, E402 and PLC0415 on an import line are allowed
+
+    def test_import_noqa_with_import_codes_is_green(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(
+            src__a_py="from pkg import plugin  # noqa: F401\n",
+            src__b_py="import late  # noqa: PLC0415\n",
+            src__c_py="from . import (  # noqa: E402, F401\n    thing,\n)\n",
+            src__d_py="import extra  # noqa: F401 registers the plugin\n",
+        )
+        self.assertNotIn("suppression-added", self.rule_names())
+
+    def test_other_noqa_shapes_are_red(self):
+        self.repo.commit(README_md="seed\n")
+        samples = {
+            "src/a.py": "value = 1  # noqa: F401\n",
+            "src/b.py": "import os  # noqa\n",
+            "src/c.py": "import os  # noqa: F811\n",
+            "src/d.py": "import os  # noqa: F401, BLE001\n",
+            "src/e.py": "import os  # noqa: F401  # type: ignore\n",
+        }
+        for path, line in samples.items():
+            self.repo.write(path, line)
+        self.repo.commit()
+        self.assertEqual(self.findings(), {(path, "suppression-added") for path in samples})
+
+    # suppression-added: a marker the file also loses on a removed line is not new
+
+    def test_changed_or_moved_suppressed_line_is_green(self):
+        self.repo.commit(
+            src__m_py="from lib import a  # pyright: ignore[reportMissingImports]\n"
+            "x = 1\ny = g()  # type: ignore[arg-type]\nz = 3\n"
+        )
+        self.repo.commit(
+            src__m_py="from lib import a, b  # pyright: ignore[reportMissingImports]\n"
+            "x = 1\nz = 3\ny = g()  # type: ignore[arg-type]\n"
+        )
+        self.assertNotIn("suppression-added", self.rule_names())
+
+    def test_net_gain_of_markers_is_reported_once(self):
+        self.repo.commit(src__m_py="a = f()  # type: ignore\nb = 2\nc = 3\n")
+        self.repo.commit(src__m_py="a = f()\nb = g()  # type: ignore\nc = h()  # type: ignore\n")
+        self.assertEqual(
+            [(p, rule) for p, _, rule, _ in self.rules_at_head()], [("src/m.py", "suppression-added")]
+        )
+
+    def test_widened_marker_and_marker_moved_to_another_file_are_red(self):
+        self.repo.commit(src__a_py="y = g()  # type: ignore[arg-type]\n", src__b_py="z = 1\n")
+        self.repo.commit(src__a_py="y = g()  # type: ignore\n")
+        self.assertEqual(self.findings(), {("src/a.py", "suppression-added")})
+        self.repo.commit(src__a_py="y = g()\n", src__b_py="z = h()  # type: ignore\n")
+        self.assertEqual(self.findings(), {("src/b.py", "suppression-added")})
+
+    # suppression-added: a reason written next to the marker does not stand in for Check-change
+
+    def test_inline_reason_does_not_release_a_marker(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(
+            src__a_py="x = f()  # type: ignore  # the upstream stub is wrong, see the tracker\n",
+            **{"web/b.tsx": "// eslint-disable-next-line no-img-element -- remote images need a plain tag\n"},
+        )
+        self.assertEqual(
+            self.findings(), {("src/a.py", "suppression-added"), ("web/b.tsx", "suppression-added")}
+        )
+
+    # check-file-weakened: a line rewritten in place counts only if it drops a word
+
+    def test_reworded_or_widened_check_lines_are_green(self):
+        self.repo.commit(
+            tools__privacy_rules_json='{"why": "a private address"}\n',
+            _github__workflows__ci_yml="jobs:\n  gate:\n    needs: [lint, test]\n",
+            pyproject_toml='[tool.ruff.lint]\nselect = ["E9", "F"]\n',
+        )
+        self.repo.commit(
+            tools__privacy_rules_json='{"why": "a private or link-local address"}\n',
+            _github__workflows__ci_yml="jobs:\n  gate:\n    needs: [lint, test, chat]\n",
+            pyproject_toml='[tool.ruff.lint]\nselect = ["E9", "F", "B"]\n',
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_narrowed_check_lines_are_red(self):
+        self.repo.commit(
+            pyproject_toml='[tool.ruff.lint]\nselect = ["E", "F"]\n',
+            _github__workflows__ci_yml="jobs:\n  test:\n    if: ${{ needs.changes.outputs.python == 'true' }}\n"
+            "    runs-on: ubuntu-24.04\n",
+        )
+        self.repo.commit(
+            pyproject_toml='[tool.ruff.lint]\nselect = ["E"]\n',
+            _github__workflows__ci_yml="jobs:\n  test:\n    if: ${{ github.event_name == 'schedule' && "
+            "needs.changes.outputs.python == 'true' }}\n    runs-on: ubuntu-24.04\n",
+        )
+        found = {(path, line, rule) for path, line, rule, _ in self.rules_at_head()}
+        self.assertEqual(
+            found,
+            {("pyproject.toml", 2, "check-file-weakened"), (".github/workflows/ci.yml", 3, "check-file-weakened")},
+        )
+
+    # check-file-weakened: a loosening line in a mixed config counts only if the file existed
+
+    def test_new_config_with_loose_setting_is_green(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(tsconfig_json='{\n  "compilerOptions": {\n    "skipLibCheck": true\n  }\n}\n')
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_loose_setting_added_to_existing_config_is_red(self):
+        self.repo.commit(tsconfig_json='{\n  "compilerOptions": {\n    "strict": true\n  }\n}\n')
+        self.repo.commit(
+            tsconfig_json='{\n  "compilerOptions": {\n    "strict": true,\n    "skipLibCheck": true\n  }\n}\n'
+        )
+        self.assertIn(("tsconfig.json", "check-file-weakened"), self.findings())
+
+    # bypass-added: hooks and CI keep every pattern; other scripts only a swallowed check
+
+    def test_plain_script_idioms_are_green(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(
+            scripts__install_sh="set +e\nlaunch stop agent || true\nrm -f x.lock || :\n",
+            bin__fetch="curl -fsS example.invalid/x || exit 0\n",
+            Makefile="clean:\n\trm -rf build || true\n",
+            package_json='{"scripts": {"commit": "HUSKY=0 git commit"}}\n',
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_swallowed_check_in_script_and_any_bypass_in_hook_are_red(self):
+        self.repo.commit(README_md="seed\n")
+        samples = {
+            "scripts/check.sh": "uv run mypy src || exit 0\n",
+            "Makefile": "lint:\n\tcargo test --all || :\n",
+            "bin/verify": "go vet ./... || true\n",
+            ".githooks/pre-commit": "make lint || true\n",
+            ".pre-commit-config.yaml": "      entry: sh -c 'set +e; make lint'\n",
+        }
+        for path, line in samples.items():
+            self.repo.write(path, line)
+        self.repo.commit()
+        self.assertEqual(self.findings(), {(path, "bypass-added") for path in samples})
+
+    # test-removed and assertion-loss: counted over all test files of the commit
+
+    def test_tests_moved_between_files_are_green(self):
+        two = "def test_a():\n    assert f() == 1\n\ndef test_b():\n    assert f() == 2\n"
+        self.repo.commit(tests__test_one_py=two, tests__test_two_py="def test_c():\n    assert 1\n")
+        self.repo.commit(
+            tests__test_one_py="def test_a():\n    assert f() == 1\n",
+            tests__test_two_py="def test_c():\n    assert 1\n\ndef test_b():\n    assert f() == 2\n",
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_renamed_test_file_is_green_but_tests_dropped_on_the_way_are_red(self):
+        self.repo.commit(tests__test_old_py=BASE_TEST)
+        self.repo.git("mv", "tests/test_old.py", "tests/test_new.py")
+        self.repo.commit("Rename")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.repo.git("mv", "tests/test_new.py", "tests/test_newer.py")
+        self.repo.write("tests/test_newer.py", BASE_TEST.replace("        assert 2 == 2\n", "        pass\n"))
+        self.repo.commit("Rename and drop an assertion")
+        self.assertEqual(self.findings(), {("tests/test_newer.py", "assertion-loss")})
+
+    def test_net_loss_with_no_test_added_elsewhere_is_red(self):
+        self.repo.commit(tests__test_a_py=BASE_TEST, tests__test_b_py="def test_c():\n    assert 1\n")
+        self.repo.commit(
+            tests__test_a_py=BASE_TEST.replace("\n    def test_two(self):\n        assert 2 == 2\n", ""),
+            tests__test_b_py="def test_c():\n    assert 1\n# touched\n",
+        )
+        self.assertEqual(
+            self.findings(), {("tests/test_a.py", "test-removed"), ("tests/test_a.py", "assertion-loss")}
+        )
+
+    def test_test_file_moved_out_of_the_tests_is_red(self):
+        self.repo.commit(tests__test_a_py=BASE_TEST)
+        self.repo.git("mv", "tests/test_a.py", "notes.txt")
+        self.repo.commit("Park")
+        self.assertEqual(self.rules_at_head(), {("notes.txt", 0, "test-removed", False)})
+
+    # test-removed: a test deleted together with the source it tests
+
+    def test_test_deleted_with_its_source_is_green(self):
+        self.repo.commit(
+            src__x_py="def f():\n    return 1\n",
+            tests__test_x_py="def test_f():\n    assert f() == 1\n",
+            **{"web/y.ts": "export const y = 1\n", "web/y.test.ts": "test('y', () => {})\n"},
+        )
+        self.repo.commit(
+            src__x_py=None, tests__test_x_py=None, **{"web/y.ts": None, "web/y.test.ts": None}
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_test_deleted_with_unrelated_source_is_red(self):
+        self.repo.commit(
+            src__x_py="def f():\n    return 1\n",
+            src__y_py="def g():\n    return 2\n",
+            tests__test_x_py="def test_f():\n    assert f() == 1\n",
+        )
+        self.repo.commit(src__y_py=None, tests__test_x_py=None)
+        self.assertEqual(self.rules_at_head(), {("tests/test_x.py", 0, "test-removed", False)})
 
 
 if __name__ == "__main__":

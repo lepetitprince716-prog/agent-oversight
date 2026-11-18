@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -28,8 +29,10 @@ from typing import NamedTuple
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 PROG = "check-integrity"
 DEFAULT_RULES = Path(__file__).resolve().with_name("check_integrity_rules.json")
-KINDS = frozenset({"added", "removed", "net-loss", "deleted"})
-RULE_KEYS = frozenset({"id", "kind", "classes", "why", "patterns", "allow", "skip_lines"})
+KINDS = frozenset({"added", "net-added", "removed", "net-loss", "deleted"})
+RULE_KEYS = frozenset(
+    {"id", "kind", "classes", "why", "patterns", "allow", "skip_lines", "existing_only", "spare_with_source"}
+)
 DOCUMENT_KEYS = frozenset({"version", "note", "classes", "rules"})
 
 JUSTIFICATION = re.compile(r"Check-change:(.*)")
@@ -39,6 +42,18 @@ HUNK = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 SHORT = 7
 TEXT_WIDTH = 80
+WORD = re.compile(r"\w+")
+CONDITION = re.compile(r"^\s*(-\s*)?if\s*:")
+CONJUNCTION = re.compile(r"&&|\band\b")
+MARKER_END = re.compile(r"\s--\s|\*/|(?<=.)#")
+# A test file and the source it tests, by file name: test_x.py or x_test.py is x.py,
+# x_test.go is x.go, x.test.ts or x.spec.ts is x plus any JavaScript or TypeScript suffix.
+SCRIPT_SUFFIXES = ("js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts")
+TEST_NAME = (
+    (re.compile(r"^test_(.+\.py)$"), ("{0}",)),
+    (re.compile(r"^(.+)_test\.(py|go)$"), ("{0}.{1}",)),
+    (re.compile(r"^(.+)\.(?:test|spec)\.[cm]?[jt]sx?$"), tuple(f"{{0}}.{s}" for s in SCRIPT_SUFFIXES)),
+)
 
 
 class IntegrityError(Exception):
@@ -57,16 +72,30 @@ class Rule:
     patterns: tuple[re.Pattern[str], ...]
     allow: tuple[re.Pattern[str], ...]
     skip_lines: tuple[re.Pattern[str], ...]
+    existing_only: bool = False
+    spare_with_source: bool = False
+
+    def skips(self, line: str) -> bool:
+        return any(skip.search(line) for skip in self.skip_lines)
+
+    def markers(self, line: str) -> list[str]:
+        """One key per pattern match no allow-regex claims: the pattern and the marker text
+        up to the end of its comment, so the same marker on a moved line has the same key."""
+        if self.skips(line):
+            return []
+        keys = []
+        for number, pattern in enumerate(self.patterns):
+            for found in pattern.finditer(line):
+                if any(allow.match(line, found.start()) for allow in self.allow):
+                    continue
+                tail = line[found.start() :]
+                end = MARKER_END.search(tail)
+                keys.append(f"{number}:{' '.join(tail[: end.start() if end else None].split())}")
+        return keys
 
     def matches(self, line: str) -> bool:
         """True if a pattern matches the line at a place no allow-regex claims."""
-        if any(skip.search(line) for skip in self.skip_lines):
-            return False
-        for pattern in self.patterns:
-            for found in pattern.finditer(line):
-                if not any(allow.match(line, found.start()) for allow in self.allow):
-                    return True
-        return False
+        return bool(self.markers(line))
 
 
 @dataclass(frozen=True)
@@ -105,6 +134,11 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
     patterns = compile_list(raw.get("patterns", []), f"{where} patterns")
     if raw["kind"] != "deleted" and not patterns:
         raise IntegrityError(f"{where}: kind {raw['kind']} needs patterns")
+    flags = {key: raw.get(key, False) for key in ("existing_only", "spare_with_source")}
+    if not all(isinstance(value, bool) for value in flags.values()):
+        raise IntegrityError(f"{where}: existing_only and spare_with_source must be true or false")
+    if flags["spare_with_source"] and raw["kind"] != "deleted":
+        raise IntegrityError(f"{where}: spare_with_source works only with kind deleted")
     return Rule(
         raw["id"],
         raw["kind"],
@@ -113,6 +147,7 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
         patterns,
         compile_list(raw.get("allow", []), f"{where} allow"),
         compile_list(raw.get("skip_lines", []), f"{where} skip_lines"),
+        **flags,
     )
 
 
@@ -143,19 +178,29 @@ def load_rules(path: Path) -> RuleSet:
 
 
 class Line(NamedTuple):
-    """One added or removed line; ``number`` is its place in the new file."""
+    """One added or removed line; ``number`` is its place in the new file, ``hunk`` the
+    number of its hunk in the file's patch."""
 
     number: int
     text: str
+    hunk: int = 0
 
 
 @dataclass
 class FileDiff:
+    """One changed file. ``status`` is A (added, or copied), M, D or R (renamed from
+    ``old_path``); a rename's lines are only the changes made on top of the move."""
+
     path: str
-    deleted: bool = False
+    status: str = "M"
+    old_path: str | None = None
     binary: bool = False
     added: list[Line] = field(default_factory=list)
     removed: list[Line] = field(default_factory=list)
+
+    @property
+    def deleted(self) -> bool:
+        return self.status == "D"
 
 
 def decode(raw: bytes) -> str:
@@ -163,13 +208,16 @@ def decode(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def parse_patch(path: str, patch: bytes, deleted: bool) -> FileDiff:
+def parse_patch(
+    path: str, patch: bytes, deleted: bool = False, status: str | None = None, old_path: str | None = None
+) -> FileDiff:
     """Parse a ``-U0`` patch of a single file. Hunk lengths decide what is content."""
-    diff = FileDiff(path, deleted)
+    diff = FileDiff(path, status or ("D" if deleted else "M"), old_path)
     lines = patch.split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
     index = 0
+    hunk = 0
     while index < len(lines) and not lines[index].startswith(b"@@"):
         header = lines[index]
         if header.startswith(b"Binary files ") or header == b"GIT binary patch":
@@ -188,6 +236,7 @@ def parse_patch(path: str, patch: bytes, deleted: bool) -> FileDiff:
         if new_line < 1:
             new_line = 1
         index += 1
+        hunk += 1
         while old_left or new_left:
             if index >= len(lines):
                 raise IntegrityError(f"cannot parse diff of {path}: hunk ends early")
@@ -197,11 +246,11 @@ def parse_patch(path: str, patch: bytes, deleted: bool) -> FileDiff:
                 continue  # "\ No newline at end of file"
             tag, text = raw[:1], decode(raw[1:])
             if tag == b"+" and new_left:
-                diff.added.append(Line(new_line, text))
+                diff.added.append(Line(new_line, text, hunk))
                 new_line += 1
                 new_left -= 1
             elif tag == b"-" and old_left:
-                diff.removed.append(Line(new_line, text))
+                diff.removed.append(Line(new_line, text, hunk))
                 old_left -= 1
             elif tag == b" " and old_left and new_left:
                 new_line += 1
@@ -230,31 +279,46 @@ def git(args: list[str]) -> bytes:
     return done.stdout
 
 
-DIFF_FLAGS = ["--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"]
+# Renames are found explicitly, whatever diff.renames says: a moved file is judged by the
+# changes made on top of the move, not as a deletion plus an addition.
+DIFF_FLAGS = ["--find-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"]
 
 
-def changed_files(base: list[str]) -> list[tuple[str, str]]:
-    """``(status, path)`` for each changed file, from ``git diff --raw -z``."""
+def changed_files(base: list[str]) -> list[tuple[str, str, str | None]]:
+    """``(status, path, old_path)`` for each changed file, from ``git diff --raw -z``.
+    A rename carries its old path; a copy counts as an added file."""
     fields = git(["diff", "--raw", "-z", *DIFF_FLAGS, *base]).split(b"\0")
     if fields and fields[-1] == b"":
         fields.pop()
-    if len(fields) % 2:
-        raise IntegrityError("cannot parse the list of changed files from git")
-    files = []
-    for meta, raw_path in zip(fields[0::2], fields[1::2]):
+    files: list[tuple[str, str, str | None]] = []
+    index = 0
+    while index < len(fields):
+        meta = fields[index]
         parts = meta.split()
         if not meta.startswith(b":") or len(parts) < 5:
             raise IntegrityError("cannot parse the list of changed files from git")
-        files.append((parts[4][:1].decode("ascii", "replace"), os.fsdecode(raw_path)))
+        status = parts[4][:1].decode("ascii", "replace")
+        count = 2 if status in ("R", "C") else 1
+        paths = [os.fsdecode(raw) for raw in fields[index + 1 : index + 1 + count]]
+        if len(paths) != count:
+            raise IntegrityError("cannot parse the list of changed files from git")
+        index += 1 + count
+        if status == "R":
+            files.append(("R", paths[1], paths[0]))
+        elif status == "C":
+            files.append(("A", paths[1], None))
+        else:
+            files.append((status, paths[0], None))
     return files
 
 
 def collect(base: list[str]) -> list[FileDiff]:
     """Parse every changed file of one diff, one git call per file."""
     diffs = []
-    for status, path in changed_files(base):
-        patch = git(["diff", "-p", "-U0", *DIFF_FLAGS, *base, "--", path])
-        diffs.append(parse_patch(path, patch, deleted=status == "D"))
+    for status, path, old_path in changed_files(base):
+        paths = [old_path, path] if old_path else [path]
+        patch = git(["diff", "-p", "-U0", *DIFF_FLAGS, *base, "--", *paths])
+        diffs.append(parse_patch(path, patch, status=status, old_path=old_path))
     return diffs
 
 
@@ -321,31 +385,131 @@ class Hit(NamedTuple):
     text: str
 
 
-def judge_file(diff: FileDiff, rules: RuleSet) -> list[Hit]:
-    """Every rule that fires on one file; a rule fires at most once per line."""
+def tested_sources(path: str) -> frozenset[str]:
+    """File names of the source a test file tests, by the TEST_NAME conventions."""
+    name = path.rpartition("/")[2]
+    for pattern, shapes in TEST_NAME:
+        found = pattern.match(name)
+        if found:
+            return frozenset(shape.format(*found.groups()) for shape in shapes)
+    return frozenset()
+
+
+def spared(diff: FileDiff, diffs: list[FileDiff]) -> bool:
+    """True if a deleted test file's source file was deleted in the same change."""
+    sources = tested_sources(diff.path)
+    return any(
+        other.deleted and other is not diff and other.path.rpartition("/")[2] in sources
+        for other in diffs
+    )
+
+
+def gone(diff: FileDiff, rule: Rule, rules: RuleSet) -> bool:
+    """True if a file of the rule's classes was deleted, or renamed out of those classes."""
+    if diff.deleted:
+        return bool(rules.classes_of(diff.path).intersection(rule.classes))
+    if diff.status == "R" and diff.old_path is not None:
+        before = rules.classes_of(diff.old_path).intersection(rule.classes)
+        return bool(before) and not rules.classes_of(diff.path).intersection(rule.classes)
+    return False
+
+
+def weakens(old: str, new: str) -> bool:
+    """For a line rewritten in place: True if the old line has a word the new one lacks, or
+    the new line adds a conjunction to a CI condition (``if:``), which narrows when it runs.
+    Only a reworded or widened line, with no word dropped, passes."""
+    if set(WORD.findall(old)) - set(WORD.findall(new)):
+        return True
+    return bool(CONDITION.match(new)) and len(CONJUNCTION.findall(new)) > len(CONJUNCTION.findall(old))
+
+
+def removed_hits(diff: FileDiff, rule: Rule) -> list[Hit]:
+    """Removed lines the rule matches. Within a hunk that replaces as many lines as it adds
+    (comment lines aside), each removed line is compared with the added line in its place
+    and reported only if the rewrite weakens it."""
+    hits = []
+    for hunk in sorted({line.hunk for line in diff.removed}):
+        gone_lines = [l for l in diff.removed if l.hunk == hunk and not rule.skips(l.text)]
+        new_lines = [l for l in diff.added if l.hunk == hunk and not rule.skips(l.text)]
+        pairs = zip(gone_lines, new_lines) if len(gone_lines) == len(new_lines) else None
+        if pairs is None:
+            hits += [Hit(diff.path, l.number, rule.id, l.text) for l in gone_lines if rule.matches(l.text)]
+            continue
+        hits += [
+            Hit(diff.path, old.number, rule.id, old.text)
+            for old, new in pairs
+            if rule.matches(old.text) and weakens(old.text, new.text)
+        ]
+    return hits
+
+
+def net_added_hits(diff: FileDiff, rule: Rule) -> list[Hit]:
+    """Added lines with a marker the file did not lose on a removed line: a marker on a
+    changed or moved line is the same marker, so only the net gain per marker is reported."""
+    available = Counter(key for line in diff.removed for key in rule.markers(line.text))
+    hits = []
+    for line in diff.added:
+        new = False
+        for key in rule.markers(line.text):
+            if available[key]:
+                available[key] -= 1
+            else:
+                new = True
+        if new:
+            hits.append(Hit(diff.path, line.number, rule.id, line.text))
+    return hits
+
+
+def net_loss_hits(diffs: list[FileDiff], rule: Rule, rules: RuleSet) -> list[Hit]:
+    """Counted over every file of the rule's classes in the change, so lines moved between
+    files cancel out. When the change loses more than it gains, each file with a net loss of
+    its own is reported at its first lost line. Deleted files are judged by deletion alone."""
+    total = 0
+    hits = []
+    for diff in diffs:
+        if diff.deleted or not rules.classes_of(diff.path).intersection(rule.classes):
+            continue
+        lost = [l for l in diff.removed if rule.matches(l.text)]
+        gained = sum(1 for l in diff.added if rule.matches(l.text))
+        total += gained - len(lost)
+        if len(lost) > gained:
+            hits.append(Hit(diff.path, lost[0].number, rule.id, lost[0].text))
+    return hits if total < 0 else []
+
+
+def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hit]:
+    """Every per-file rule that fires on one file; ``diffs`` is the whole change."""
     classes = rules.classes_of(diff.path)
     hits: list[Hit] = []
     for rule in rules.rules:
-        if not classes.intersection(rule.classes):
-            continue
         if rule.kind == "deleted":
-            if diff.deleted:
+            if gone(diff, rule, rules) and not (rule.spare_with_source and spared(diff, diffs)):
                 hits.append(Hit(diff.path, 0, rule.id, "(file deleted)"))
-        elif diff.deleted:
+            continue
+        if diff.deleted or rule.kind == "net-loss" or not classes.intersection(rule.classes):
             continue  # a deleted file is judged by its deletion alone
-        elif rule.kind == "added":
+        if rule.existing_only and diff.status == "A":
+            continue
+        if rule.kind == "added":
             hits += [Hit(diff.path, l.number, rule.id, l.text) for l in diff.added if rule.matches(l.text)]
-        elif rule.kind == "removed":
-            hits += [Hit(diff.path, l.number, rule.id, l.text) for l in diff.removed if rule.matches(l.text)]
-        else:  # net-loss
-            lost = [l for l in diff.removed if rule.matches(l.text)]
-            gained = sum(1 for l in diff.added if rule.matches(l.text))
-            if len(lost) > gained:
-                hits.append(Hit(diff.path, lost[0].number, rule.id, lost[0].text))
-    unique: dict[tuple[int, str], Hit] = {}
+        elif rule.kind == "net-added":
+            hits += net_added_hits(diff, rule)
+        else:  # removed
+            hits += removed_hits(diff, rule)
+    return hits
+
+
+def judge_change(diffs: list[FileDiff], rules: RuleSet) -> list[Hit]:
+    """Every rule that fires on one change, in diff order; a rule fires once per line."""
+    hits = [hit for diff in diffs for hit in judge_file(diff, diffs, rules)]
+    for rule in rules.rules:
+        if rule.kind == "net-loss":
+            hits += net_loss_hits(diffs, rule, rules)
+    order = {diff.path: number for number, diff in enumerate(diffs)}
+    unique: dict[tuple[str, int, str], Hit] = {}
     for hit in hits:
-        unique.setdefault((hit.line, hit.rule), hit)
-    return sorted(unique.values(), key=lambda hit: (hit.line, hit.rule))
+        unique.setdefault((hit.path, hit.line, hit.rule), hit)
+    return sorted(unique.values(), key=lambda hit: (order[hit.path], hit.line, hit.rule))
 
 
 def justified(message: str) -> bool:
@@ -361,9 +525,7 @@ def justified(message: str) -> bool:
 
 def judge(where: str, diffs: list[FileDiff], message: str, rules: RuleSet) -> list[Finding]:
     ok = justified(message)
-    return [
-        Finding(where, *hit, ok) for diff in diffs for hit in judge_file(diff, rules)
-    ]
+    return [Finding(where, *hit, ok) for hit in judge_change(diffs, rules)]
 
 
 def read_message_file(path: Path | None) -> str:
