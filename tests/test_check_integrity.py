@@ -2741,6 +2741,19 @@ class CiScanStep(unittest.TestCase):
         self.assertIn("fetch-depth: 0", checkout)
         self.assertIn("persist-credentials: false", checkout)
 
+    def test_the_scans_judge_the_head_commit_of_a_pull_request_not_the_merge_commit_github_makes(self):
+        """The default checkout of a pull request is a merge commit GitHub creates for the run, with the
+        web identity of the account that opened it; the privacy scan reads every commit it can see, so
+        that commit's address is judged and refused. The scanning job checks out the head commit."""
+        jobs = self.jobs()
+        scanning = next(n for n, (_, steps) in jobs.items() if any(s[0].startswith("name: Check-integrity scan") for s in steps))
+        testing = next(n for n, (_, steps) in jobs.items() if any(s[0] == "name: Tests" for s in steps))
+        gates_checkout = [line.strip() for line in jobs[scanning][1][0]]
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", gates_checkout)
+        tests_checkout = [line.strip() for line in jobs[testing][1][0]]
+        self.assertTrue(tests_checkout[0].startswith("uses: actions/checkout@"), tests_checkout)
+        self.assertEqual([line for line in tests_checkout if line.startswith("ref:")], [])
+
     def test_both_jobs_keep_their_runner_and_time_limit(self):
         jobs = self.jobs()
         self.assertEqual(len(jobs), 2, list(jobs))
@@ -3001,6 +3014,59 @@ class RepositoryHooks(unittest.TestCase):
         )
         self.assertNotEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
         self.assertIn("skip-added", pushed.stdout + pushed.stderr)
+
+    LEAK = "192.168." + "1.20"
+
+    def drop_a_stand_in_for_json(self):
+        """tools/json.py is not committed, so only the working tree has it; privacy_scan.py imports json."""
+        self.repo.write("tools/json.py", "import os; os._exit(0)\n")
+
+    def assert_the_stand_in_would_work(self, *args):
+        """Control: started the plain way, the privacy scanner exits 0 and says nothing, so the stand-in
+        is live and a refusal by the hook is because of isolated mode."""
+        done = subprocess.run(
+            ["python3", "-B", "tools/privacy_scan.py", *args],
+            cwd=self.repo.root,
+            env=self.repo.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
+
+    def test_pre_commit_privacy_scan_is_not_fooled_by_a_module_dropped_next_to_the_scanner(self):
+        self.drop_a_stand_in_for_json()
+        before = self.head()
+        self.stage("src/a.py", f"host = '{self.LEAK}'\n")
+        code, out = self.commit("Add a host")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("src/a.py:1: lan_ip", out)
+        self.assertEqual(self.head(), before)
+        self.assert_the_stand_in_would_work("--identity", "--staged")
+
+    def test_commit_msg_privacy_scan_is_not_fooled_by_a_module_dropped_next_to_the_scanner(self):
+        self.drop_a_stand_in_for_json()
+        before = self.head()
+        self.stage("src/a.py", "x = 2\n")
+        message = self.repo.root / "message.txt"
+        message.write_text(f"Contact {self.LEAK} about it\n", encoding="utf-8")
+        code, out = self.commit(f"Contact {self.LEAK} about it")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("lan_ip", out)
+        self.assertEqual(self.head(), before)
+        self.assert_the_stand_in_would_work("--message", str(message))
+
+    def test_pre_push_privacy_scan_is_not_fooled_by_a_module_dropped_next_to_the_scanner(self):
+        self.repo.git("push", "-q", "origin", "main")
+        self.drop_a_stand_in_for_json()
+        self.stage("src/a.py", f"host = '{self.LEAK}'\n")
+        self.plumb_commit("Add a host")  # plumbing runs no hook, so only the push check is under test
+        pushed = subprocess.run(
+            ["git", "push", "origin", "main"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
+        )
+        self.assertNotEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
+        self.assertIn("src/a.py:1: lan_ip", pushed.stdout + pushed.stderr)
+        self.assert_the_stand_in_would_work("--history")
 
     def test_pre_push_refuses_an_unjustified_commit_and_accepts_it_once_justified(self):
         self.repo.git("push", "-q", "origin", "main")

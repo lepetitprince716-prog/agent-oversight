@@ -280,7 +280,9 @@ commits that no remote-tracking branch has.
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the same scan on every pull request and
 on every push. The workflow has two jobs: `gates` holds the privacy scan and this scan and no
 other step, so it runs no code from the change being judged, and `tests` runs the repository's own
-tests. The scanners start in isolated mode (`python3 -I -B`). A newer run replaces an older one
+tests. On a pull request `gates` checks out the head commit and scans it and its history, not the
+merge commit GitHub makes for the run (that commit carries the web identity of the account that
+opened the pull request, which the privacy scan would refuse). The scanners start in isolated mode (`python3 -I -B`). A newer run replaces an older one
 only on a pull request: a push is scanned from its old tip to its new one, so a cancelled push
 run would leave the commits it brought unscanned. The scanner, its rules and `.check-integrity.json` always come from a baseline, not
 from the commits being judged: the base branch for a pull request, the default branch for a push
@@ -311,6 +313,12 @@ has nothing to scan and says so.
     first place is one of the things the `tests` job is for.
 - A push to the default branch is scanned, but a finding there is only a warning: the step does
   not fail.
+- When a pull request is merged with GitHub's merge button, GitHub documents that the commit that
+  lands on the default branch is written with the web identity of the account that merges. If that
+  account has not turned on "Keep my email addresses private", the address is not on the allowed
+  list and the privacy scan of the default branch fails after the merge. Either turn the setting on
+  in the account's GitHub email settings, or merge locally and push. This was checked only on the
+  merge commit GitHub makes for a pull request run, not on a button merge in this repository.
 - The rules are tripwires that read one line at a time, not a proof. Swapping an assertion for a
   weaker one that is not always true, or moving the checking logic into a script that is not in
   the `machinery` class, goes unseen. A repository can add such a script to the `machinery` class

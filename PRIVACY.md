@@ -31,9 +31,12 @@ was not enough.
    `oversight reconcile` reports `guard_off` for a repository marked `public` in its config
    whose local clone has no executable pre-push hook.
 
-3. CI. `.github/workflows/ci.yml` runs the tests and the same scan over the tree and the
-   whole history on every push and pull request. On a pull request the scanner and its rules
-   are taken from the base branch, so a change cannot loosen the rules it is judged by. It
+3. CI. `.github/workflows/ci.yml` has two jobs: `gates` runs the same scan over the tree and
+   the whole history on every push and pull request, and `tests` runs the tests. On a pull
+   request `gates` checks out and scans the head commit and its history, not the merge commit
+   GitHub makes for the run: that commit is written with the web identity of the account that
+   opened the pull request, whose address is not on the allowed list. The scanner and its rules
+   are taken from the base branch on a pull request, so a change cannot loosen the rules it is judged by. It
    can still edit the workflow file, and GitHub runs the pull request's own copy of that:
    read every change under `.github/` before it merges. CI runs after the content has
    reached GitHub: it catches what slipped past the hooks and what other people send, and it
