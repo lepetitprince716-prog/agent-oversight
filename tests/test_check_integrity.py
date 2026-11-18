@@ -7,6 +7,7 @@ repositories hold skip markers and suppressions on purpose: they are the input.
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -2402,9 +2403,9 @@ class CiScanStep(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
 
     @classmethod
-    def step_script(cls):
+    def step_script(cls, name="Check-integrity scan"):
         lines = (cls.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
-        start = next(n for n, line in enumerate(lines) if line.strip().startswith("- name: Check-integrity scan"))
+        start = next(n for n, line in enumerate(lines) if line.strip().startswith(f"- name: {name}"))
         run = next(n for n in range(start, len(lines)) if lines[n].strip() == "run: |")
         indent = len(lines[run + 1]) - len(lines[run + 1].lstrip())
         body = []
@@ -2428,7 +2429,7 @@ class CiScanStep(unittest.TestCase):
         self.bad = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
         self.repo.git("update-ref", "refs/remotes/origin/main", self.base_sha)
 
-    def run_step(self, **variables):
+    def run_step(self, script=None, **variables):
         values = {
             "RUNNER_TEMP": str(self.runner_temp),
             "BASE_REF": "",
@@ -2440,7 +2441,7 @@ class CiScanStep(unittest.TestCase):
         }
         values.update(variables)
         done = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", self.step_script()],
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script or self.step_script()],
             cwd=self.repo.root,
             env={**self.repo.env, **values},
             capture_output=True,
@@ -2701,6 +2702,118 @@ class CiScanStep(unittest.TestCase):
         _, tip = self.feature(("Add the scanner", scanner), base=bare)
         self.assert_blocked_everywhere(tip, bare)
 
+    WORKFLOW_TEXT = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    @classmethod
+    def jobs(cls):
+        """The jobs of ci.yml, read as text: name -> (the lines of the job, its steps). A step is the
+        lines from one "- " at the step indent to the next, labelled by that first line."""
+        jobs = {}
+        name = None
+        in_jobs = False
+        for line in cls.WORKFLOW_TEXT.splitlines():
+            if line.rstrip() == "jobs:":
+                in_jobs = True
+            elif in_jobs and re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+                name = line.strip().rstrip(":")
+                jobs[name] = ([], [])
+            elif in_jobs and name is not None:
+                jobs[name][0].append(line)
+                if line.startswith("      - "):
+                    jobs[name][1].append([line.strip()[2:]])
+                elif jobs[name][1]:
+                    jobs[name][1][-1].append(line)
+        return jobs
+
+    def test_the_scans_have_a_job_of_their_own_with_no_step_that_runs_the_repositorys_code(self):
+        jobs = self.jobs()
+        scanning = [n for n, (_, steps) in jobs.items() if any(s[0].startswith("name: Check-integrity scan") for s in steps)]
+        testing = [n for n, (_, steps) in jobs.items() if any(s[0] == "name: Tests" for s in steps)]
+        self.assertEqual(len(scanning), 1, list(jobs))
+        self.assertEqual(len(testing), 1, list(jobs))
+        self.assertNotEqual(scanning, testing, "the tests run in the job that holds the scans")
+        labels = [step[0] for step in jobs[scanning[0]][1]]
+        self.assertEqual(len(labels), 3, labels)
+        self.assertTrue(labels[0].startswith("uses: actions/checkout@"), labels)
+        self.assertTrue(labels[1].startswith("name: Privacy scan"), labels)
+        self.assertTrue(labels[2].startswith("name: Check-integrity scan"), labels)
+        checkout = "\n".join(jobs[scanning[0]][1][0])
+        self.assertIn("fetch-depth: 0", checkout)
+        self.assertIn("persist-credentials: false", checkout)
+
+    def test_both_jobs_keep_their_runner_and_time_limit(self):
+        jobs = self.jobs()
+        self.assertEqual(len(jobs), 2, list(jobs))
+        for name, (lines, _) in jobs.items():
+            with self.subTest(name):
+                self.assertIn("    runs-on: ubuntu-24.04", lines)
+                self.assertIn("    timeout-minutes: 10", lines)
+
+    def test_both_scanners_are_started_in_isolated_mode(self):
+        lines = [line.strip() for line in self.WORKFLOW_TEXT.splitlines() if 'python3 ' in line and '"$scanner"' in line]
+        self.assertEqual(len(lines), 2, lines)
+        for line in lines:
+            self.assertTrue(line.startswith("python3 -I -B "), line)
+
+    def test_only_a_pull_request_run_is_cancelled_by_a_newer_one(self):
+        lines = [line.strip() for line in self.WORKFLOW_TEXT.splitlines() if line.strip().startswith("cancel-in-progress:")]
+        self.assertEqual(lines, ["cancel-in-progress: ${{ github.event_name == 'pull_request' }}"])
+
+    def stand_in_for_the_library(self, module):
+        """A file in the runner's temp folder, where the step puts the scanner, that ends the
+        process with status 0 as soon as the scanner imports the module it is named after."""
+        (self.runner_temp / f"{module}.py").write_text("import os; os._exit(0)\n", encoding="utf-8")
+
+    def assert_the_stand_in_would_work(self, scanner, *args):
+        """Control: started the plain way, the scanner copy the step left behind does exit 0 and say
+        nothing, so the stand-in is live and a refusal in the step is because of isolated mode."""
+        done = subprocess.run(
+            ["python3", "-B", str(self.runner_temp / scanner), *args],
+            cwd=self.repo.root,
+            env=self.repo.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
+
+    def test_a_module_planted_next_to_the_scanner_cannot_stand_in_for_the_standard_library(self):
+        self.stand_in_for_the_library("bisect")
+        pull_request = dict(BASE_REF="main", PR_HEAD=self.bad, REF="refs/pull/7/merge")
+        code, out = self.run_step(**pull_request)
+        self.assertEqual(code, 1, out)
+        self.assertIn("skip-added", out)
+        self.assert_the_stand_in_would_work("check_integrity.py", "--commit", "HEAD")
+        code, out = self.run_step()  # a push to the default branch: the finding is a warning
+        self.assertEqual(code, 0, out)
+        self.assertIn("skip-added", out)
+        self.assertIn("::warning::", out)
+
+    def test_a_module_planted_next_to_the_privacy_scanner_cannot_stand_in_for_the_standard_library(self):
+        # a repository of its own: the privacy scan reads the author of every commit, and the one
+        # of setUp is not on the list of allowed addresses
+        (Path(self._tmp.name) / "privacy").mkdir()
+        self.repo = Repo(Path(self._tmp.name) / "privacy")
+        for name in ("privacy_scan.py", "privacy_rules.json"):
+            self.repo.write(f"tools/{name}", (self.ROOT / "tools" / name).read_bytes())
+        self.repo.env.update(
+            GIT_AUTHOR_EMAIL="1+author@users.noreply.github.com",
+            GIT_COMMITTER_EMAIL="1+author@users.noreply.github.com",
+            AGENT_OVERSIGHT_PRIVATE_RULES=str(self.runner_temp / "no-private-rules.json"),
+        )
+        clean = self.repo.commit("Add the privacy scanner")
+        self.seed_baseline(clean)
+        script = self.step_script("Privacy scan")
+        pull_request = dict(BASE_REF="main", PR_HEAD=clean, REF="refs/pull/7/merge")
+        code, out = self.run_step(script=script, **pull_request)
+        self.assertEqual(code, 0, "a clean history passes:\n" + out)
+        self.repo.commit("Leak an address", src__a_py="host = '192.168." + "1.20'\n")
+        self.stand_in_for_the_library("json")
+        code, out = self.run_step(script=script, **pull_request)
+        self.assertEqual(code, 1, out)
+        self.assertIn("src/a.py:1: lan_ip", out)
+        self.assert_the_stand_in_would_work("privacy_scan.py", "--rules", str(self.runner_temp / "privacy_rules.json"))
+
 
 class PushRefs(RepoCase):
     """--pre-push reads the lines git gives a pre-push hook and scans the commits they bring."""
@@ -2863,6 +2976,31 @@ class RepositoryHooks(unittest.TestCase):
         code, out = self.commit("Contact 192.168." + "1.20 about it")
         self.assertNotEqual(code, 0, out)
         self.assertEqual(self.head(), before)
+
+    def test_a_module_dropped_next_to_the_scanner_cannot_stand_in_for_the_standard_library(self):
+        """tools/bisect.py is not committed, so only the working tree has it; the scanner imports bisect."""
+        self.repo.write("tools/bisect.py", "import os; os._exit(0)\n")
+        before = self.head()
+        self.stage(
+            "tests/test_thing.py", BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two")
+        )
+        code, out = self.commit("Park a test")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("skip-added", out)
+        self.assertEqual(self.head(), before)
+
+    def test_pre_push_is_not_fooled_by_a_module_dropped_next_to_the_scanner_either(self):
+        self.repo.git("push", "-q", "origin", "main")
+        self.repo.write("tools/bisect.py", "import os; os._exit(0)\n")
+        self.stage(
+            "tests/test_thing.py", BASE_TEST.replace("    def test_two", "    @unittest.skip('x')\n    def test_two")
+        )
+        self.plumb_commit("Park a test")
+        pushed = subprocess.run(
+            ["git", "push", "origin", "main"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
+        )
+        self.assertNotEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
+        self.assertIn("skip-added", pushed.stdout + pushed.stderr)
 
     def test_pre_push_refuses_an_unjustified_commit_and_accepts_it_once_justified(self):
         self.repo.git("push", "-q", "origin", "main")

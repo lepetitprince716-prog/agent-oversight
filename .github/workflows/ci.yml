@@ -9,10 +9,17 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a pull request run is replaced by a newer one. A push is scanned from the old tip
+  # to the new one, so a cancelled push run would leave the commits it brought unscanned.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
+  # The two scans judge a change, so they run in a job of their own with no step that runs
+  # code from the repository: the code being judged cannot reach them. The interpreter runs
+  # in isolated mode (-I), which keeps the scanner's own directory and the environment out
+  # of the module search path, so a file dropped next to the scanner cannot stand in for a
+  # standard library module.
+  gates:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -20,8 +27,6 @@ jobs:
         with:
           fetch-depth: 0 # the privacy scan reads the whole history
           persist-credentials: false
-      - name: Tests
-        run: python3 -B -m unittest discover -s tests
       - name: Privacy scan of the tree and the whole history
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -37,7 +42,7 @@ jobs:
             scanner="$RUNNER_TEMP/privacy_scan.py"
             rules="$RUNNER_TEMP/privacy_rules.json"
           fi
-          python3 -B "$scanner" --rules "$rules" --tracked --history
+          python3 -I -B "$scanner" --rules "$rules" --tracked --history
       - name: Check-integrity scan of the commits being added
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -110,9 +115,20 @@ jobs:
           # Otherwise the baseline has no scanner yet: this is the change that first adds it,
           # so it is judged by its own copy. Read it before merging.
           code=0
-          python3 -B "$scanner" --rules "$rules" $overlay "$mode" "$target" || code=$?
+          python3 -I -B "$scanner" --rules "$rules" $overlay "$mode" "$target" || code=$?
           if [ "$on_default" = yes ] && [ "$code" = 1 ]; then
             echo "::warning::check-integrity: unjustified changes landed on $DEFAULT_BRANCH (see the scan above); a squash merge can drop the Check-change line, so confirm the change was intended"
             exit 0
           fi
           exit "$code"
+
+  # The repository's own tests run code from the repository, so they run apart from the scans.
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tests
+        run: python3 -B -m unittest discover -s tests

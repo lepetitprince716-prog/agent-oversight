@@ -267,14 +267,22 @@ repository's hooks. The first lines of this repository's `.githooks/commit-msg` 
 #!/bin/sh
 set -eu
 cd "$(git rev-parse --show-toplevel)"
-python3 tools/check_integrity.py --staged --message-file "$1"
+python3 -I -B tools/check_integrity.py --staged --message-file "$1"
 ```
+
+`-I` (isolated mode) keeps the scanner's own folder and the `PYTHON*` environment variables out of
+the module search path, so a file dropped next to the scanner cannot stand in for a standard
+library module it imports.
 
 For a pre-push hook, pipe git's standard input into `--pre-push` and pass the remote's name
 (`--remote "$1"`), which a new branch needs to find its baseline; a new branch is scanned for the
 commits that no remote-tracking branch has.
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the same scan on every pull request and
-on every push. The scanner, its rules and `.check-integrity.json` always come from a baseline, not
+on every push. The workflow has two jobs: `gates` holds the privacy scan and this scan and no
+other step, so it runs no code from the change being judged, and `tests` runs the repository's own
+tests. The scanners start in isolated mode (`python3 -I -B`). A newer run replaces an older one
+only on a pull request: a push is scanned from its old tip to its new one, so a cancelled push
+run would leave the commits it brought unscanned. The scanner, its rules and `.check-integrity.json` always come from a baseline, not
 from the commits being judged: the base branch for a pull request, the default branch for a push
 to another branch, the old tip for a push to the default branch (a baseline without a scanner is
 judged by the copy in the change itself). A pull request scans the commits it adds; a new branch
@@ -288,8 +296,19 @@ has nothing to scan and says so.
 ### Limits of the commit check
 
 - The local hooks, and the scanner they call, come from the working tree. Anyone or any agent
-  with write access can switch them off locally. What holds is the CI step, which judges with the
-  scanner, the rules and the overlay of the baseline.
+  with write access can switch them off locally. The CI step is the stronger check, and it has
+  limits of its own:
+  - The `gates` job runs no code from the change being judged: the repository's tests run in the
+    separate `tests` job, and the scanners start in isolated mode, so a file the change drops next
+    to them cannot stand in for a standard library module. The step judges with the scanner, the
+    rules and the overlay of the baseline.
+  - When a pull request changes the workflow file itself, GitHub runs the pull request's own
+    version of it, and that change can rewrite this step. Such a change has to be read by a
+    person; the scan of the push to the default branch after the merge reports it as a warning.
+  - When the rules file or the scanner on the default branch is itself broken (it cannot be
+    loaded), this step fails for every pull request, the one that repairs it included, and the
+    repair can only merge with a red check. Keeping a broken rules file from being merged in the
+    first place is one of the things the `tests` job is for.
 - A push to the default branch is scanned, but a finding there is only a warning: the step does
   not fail.
 - The rules are tripwires that read one line at a time, not a proof. Swapping an assertion for a
