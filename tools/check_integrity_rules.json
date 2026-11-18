@@ -1,0 +1,248 @@
+{
+  "version": 1,
+  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern, 'removed' on a removed line, 'net-loss' when a file loses more matching lines than it gains, 'deleted' when a file of the class is deleted. A deleted file is judged by 'deleted' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. An id may appear in several entries.",
+  "classes": {
+    "test": [
+      "(^|/)tests?/",
+      "(^|/)test_[^/]*\\.py$",
+      "(^|/)[^/]*_test\\.py$",
+      "(^|/)conftest\\.py$",
+      "(^|/)[^/]*\\.(test|spec)\\.[cm]?[jt]sx?$",
+      "(^|/)[^/]*_test\\.go$"
+    ],
+    "source": [
+      "\\.(py|pyi|js|jsx|mjs|cjs|ts|tsx|mts|cts|rs|go|sh|bash|zsh|rb|java|kt|kts|c|cc|cpp|cxx|h|hh|hpp|cs|swift|php|lua|ps1)$",
+      "(^|/)\\.githooks/",
+      "(^|/)\\.husky/"
+    ],
+    "bypass": [
+      "(^|/)\\.githooks/",
+      "(^|/)\\.husky/",
+      "(^|/)\\.pre-commit-config\\.ya?ml$",
+      "(^|/)\\.?lefthook(-local)?\\.ya?ml$",
+      "(^|/)\\.github/workflows/",
+      "(^|/)\\.gitlab-ci\\.ya?ml$",
+      "(^|/)\\.circleci/",
+      "(^|/)azure-pipelines\\.ya?ml$",
+      "(^|/)scripts?/",
+      "(^|/)bin/",
+      "\\.(sh|bash|zsh|ps1|cmd|bat)$",
+      "(^|/)(GNUmakefile|[Mm]akefile)$",
+      "\\.mk$",
+      "(^|/)[Jj]ustfile$",
+      "(^|/)package\\.json$",
+      "(^|/)tox\\.ini$",
+      "(^|/)noxfile\\.py$"
+    ],
+    "check": [
+      "(^|/)\\.githooks/",
+      "(^|/)\\.husky/",
+      "(^|/)\\.pre-commit-config\\.ya?ml$",
+      "(^|/)\\.?lefthook(-local)?\\.ya?ml$",
+      "(^|/)\\.github/workflows/",
+      "(^|/)\\.gitlab-ci\\.ya?ml$",
+      "(^|/)\\.circleci/",
+      "(^|/)\\.?ruff\\.toml$",
+      "(^|/)\\.?mypy\\.ini$",
+      "(^|/)\\.flake8$",
+      "(^|/)\\.?pylintrc$",
+      "(^|/)pyrightconfig\\.json$",
+      "(^|/)pytest\\.ini$",
+      "(^|/)\\.coveragerc$",
+      "(^|/)\\.eslintrc([.][A-Za-z]+)?$",
+      "(^|/)eslint\\.config\\.[cm]?[jt]s$",
+      "(^|/)biome\\.jsonc?$",
+      "(^|/)\\.?clippy\\.toml$",
+      "(^|/)deny\\.toml$",
+      "(^|/)\\.golangci\\.(ya?ml|toml|json)$",
+      "(^|/)\\.shellcheckrc$",
+      "(^|/)\\.stylelintrc([.][A-Za-z]+)?$",
+      "(^|/)\\.markdownlint(-cli2)?\\.(jsonc?|ya?ml)$",
+      "(^|/)tools/check_integrity\\.py$",
+      "(^|/)tools/check_integrity_rules\\.json$",
+      "(^|/)tools/privacy_scan\\.py$",
+      "(^|/)tools/privacy_rules\\.json$"
+    ],
+    "mixed": [
+      "(^|/)pyproject\\.toml$",
+      "(^|/)setup\\.cfg$",
+      "(^|/)tox\\.ini$",
+      "(^|/)Cargo\\.toml$",
+      "(^|/)[jt]sconfig[^/]*\\.json$",
+      "(^|/)deno\\.jsonc?$",
+      "(^|/)\\.gitattributes$"
+    ]
+  },
+  "rules": [
+    {
+      "id": "skip-added",
+      "kind": "added",
+      "classes": ["test"],
+      "why": "a test is skipped, focused or expected to fail",
+      "patterns": [
+        "@unittest\\.(skip\\w*|expectedFailure)\\b",
+        "^\\s*@(skip(If|Unless)?|expectedFailure)\\b",
+        "\\bskipTest\\s*\\(",
+        "\\bSkipTest\\b",
+        "\\bpytest\\.mark\\.(skip\\w*|xfail)\\b",
+        "\\bpytest\\.(skip|xfail)\\s*\\(",
+        "\\.(skip|only|todo|fails)\\b\\s*[.(`]",
+        "(?<![\\w.$])[xf](it|test|describe|context)\\s*\\(\\s*['\"`]",
+        "#\\[ignore\\b",
+        "\\b[tb]\\.Skip(f|Now)?\\s*\\("
+      ]
+    },
+    {
+      "id": "suppression-added",
+      "kind": "added",
+      "classes": ["source"],
+      "why": "a checker is told to look away",
+      "patterns": [
+        "#\\s*type:\\s*ignore\\b",
+        "#\\s*noqa\\b",
+        "#\\s*ruff:\\s*noqa\\b",
+        "#\\s*pyright:\\s*(ignore|basic)\\b",
+        "#\\s*mypy:\\s*ignore-errors\\b",
+        "#\\s*pylint:\\s*disable\\b",
+        "#\\s*pragma:\\s*no\\s*cover\\b",
+        "#\\s*nosec\\b",
+        "@ts-(ignore|expect-error|nocheck)\\b",
+        "\\beslint-disable",
+        "\\bbiome-ignore\\b",
+        "\\bdeno-lint-ignore",
+        "(istanbul|c8|v8)\\s+ignore\\b",
+        "#!?\\[(allow|expect)\\(",
+        "//\\s*nolint\\b",
+        "\\bNOLINT",
+        "#\\s*shellcheck\\s+disable\\b",
+        "@SuppressWarnings\\b"
+      ],
+      "allow": [
+        "#\\s*noqa:\\s*E402\\b(?!\\s*,)"
+      ]
+    },
+    {
+      "id": "bypass-added",
+      "kind": "added",
+      "classes": ["bypass"],
+      "why": "a hook, CI step or script is told to ignore failure or skip checks",
+      "patterns": [
+        "--no-verify\\b",
+        "\\bgit\\s+(commit|push|merge|am)\\b[^\\n]*\\s-n\\b",
+        "\\|\\|\\s*true\\b",
+        "\\|\\|\\s*:(?![\\w:])",
+        "\\|\\|\\s*exit\\s+0\\b",
+        "\\bset\\s+\\+e\\b",
+        "\\bcontinue-on-error:\\s*['\"]?true\\b",
+        "^\\s*-?\\s*if:\\s*(\\$\\{\\{\\s*)?false\\b",
+        "\\ballow_failure:\\s*true\\b",
+        "\\bHUSKY=0\\b",
+        "\\bSKIP=\\S",
+        "\\bcore\\.hooksPath\\b"
+      ]
+    },
+    {
+      "id": "test-removed",
+      "kind": "deleted",
+      "classes": ["test"],
+      "why": "a test file was deleted"
+    },
+    {
+      "id": "test-removed",
+      "kind": "net-loss",
+      "classes": ["test"],
+      "why": "the file lost more test definitions than it gained",
+      "patterns": [
+        "^\\s*(async\\s+)?def\\s+test\\w*\\s*\\(",
+        "(?<![\\w.$])(it|test)\\s*\\(",
+        "(?<![\\w.$])(it|test)\\.(each|concurrent)\\b",
+        "#\\[(\\w+::)?test\\b",
+        "^\\s*func\\s+(Test|Fuzz)\\w*\\s*\\("
+      ]
+    },
+    {
+      "id": "assertion-loss",
+      "kind": "net-loss",
+      "classes": ["test"],
+      "why": "the file lost more assertion lines than it gained",
+      "patterns": [
+        "^\\s*assert\\b",
+        "\\bself\\.(assert|fail)\\w*\\s*\\(",
+        "\\b(np\\.testing\\.)?assert_\\w+\\s*\\(",
+        "\\bpytest\\.raises\\s*\\(",
+        "\\bexpect\\s*\\(",
+        "\\bassert(\\.\\w+)?\\s*\\(",
+        "\\b(debug_)?assert(_eq|_ne)?!\\s*\\(",
+        "\\bt\\.(Error|Errorf|Fatal|Fatalf|Fail|FailNow)\\b",
+        "\\b(require|assert)\\.[A-Z]\\w*\\s*\\("
+      ]
+    },
+    {
+      "id": "check-file-weakened",
+      "kind": "deleted",
+      "classes": ["check"],
+      "why": "a check file (hook, CI, lint or type config, scanner) was deleted"
+    },
+    {
+      "id": "check-file-weakened",
+      "kind": "removed",
+      "classes": ["check"],
+      "why": "a line was removed from a check file",
+      "patterns": ["\\S"],
+      "skip_lines": ["^\\s*(#|//|;|/\\*|\\*|<!--)"]
+    },
+    {
+      "id": "check-file-weakened",
+      "kind": "removed",
+      "classes": ["mixed"],
+      "why": "a line that tightens a check was removed",
+      "patterns": [
+        "\\bstrict\\w*[\"']?\\s*[:=]\\s*[\"']?(true|strict|error|all)\\b",
+        "\\bnoImplicit\\w+",
+        "\\bnoUnused\\w+",
+        "\\bnoUnchecked\\w+",
+        "\\bexactOptionalPropertyTypes\\b",
+        "\\bdisallow_\\w+",
+        "\\bwarn_(unused|return|redundant)\\w*",
+        "\\bcheck_untyped_defs\\b",
+        "\\bfail_under\\b",
+        "--cov-fail-under\\b",
+        "--strict\\w*",
+        "\\b(extend-)?select\\s*=",
+        "=\\s*[\"']?(deny|forbid|warn)[\"']?\\s*$",
+        "\\bfilterwarnings\\b",
+        "\\berror::",
+        "\\bunsafe_code\\b",
+        "\\[tool\\.(mypy|ruff|pyright|pylint|pytest|coverage|flake8|black)[\\].]",
+        "\\[(lints|workspace\\.lints)[\\].]"
+      ],
+      "skip_lines": ["^\\s*(#|//|;)"]
+    },
+    {
+      "id": "check-file-weakened",
+      "kind": "added",
+      "classes": ["mixed"],
+      "why": "a line that loosens a check was added",
+      "patterns": [
+        "\\bstrict\\w*[\"']?\\s*[:=]\\s*[\"']?(false|off|basic|none)\\b",
+        "\\b(extend-|per-file-)?ignores?\\w*[\"']?\\s*[:=]",
+        "\\b(extend-|force-)?exclude\\w*[\"']?\\s*[:=]",
+        "\\bignore_(errors|missing_imports)\\s*=\\s*true\\b",
+        "\\bskip\\w*[\"']?\\s*[:=]",
+        "\"skipLibCheck\"\\s*:\\s*true\\b",
+        "\"checkJs\"\\s*:\\s*false\\b",
+        "\\bfollow_imports\\s*=\\s*[\"']?(skip|silent)",
+        "\\bfail_under\\s*=\\s*0\\b",
+        "=\\s*[\"']allow[\"']",
+        "\\blevel\\s*=\\s*[\"']allow[\"']",
+        "--(ignore|deselect)\\b",
+        "\\s-k\\s",
+        "\\b(noqa|nosec)\\b",
+        "(^|\\s)-diff\\b",
+        "\\sbinary\\b",
+        "\\blinguist-generated\\b"
+      ],
+      "skip_lines": ["^\\s*(#|//|;)"]
+    }
+  ]
+}
