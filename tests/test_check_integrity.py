@@ -90,10 +90,10 @@ class Repo:
         else:
             self.write(path, content)
 
-    def scan(self, *args, stdin=None):
+    def scan(self, *args, stdin=None, cwd=None):
         done = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), *args],
-            cwd=self.root,
+            cwd=cwd or self.root,
             env=self.env,
             input=None if stdin is None else stdin.encode(),
             capture_output=True,
@@ -618,15 +618,20 @@ class MergeCommits(RepoCase):
         self.merge(**{".github__workflows__ci_yml": "steps:\n  - run: make test-a\n"})
         self.assertEqual(self.rule_names(), {"check-file-weakened"})
 
-    def test_an_octopus_merge_exits_2_instead_of_passing_unjudged(self):
+    def test_an_octopus_merge_is_an_unreadable_change_not_a_pass_and_not_a_crash(self):
         for name in ("one", "two"):
             self.branch_off(name)
             self.repo.commit(f"Add {name}", **{f"src__{name}_py": "x = 1\n"})
         self.repo.git("checkout", "-q", "main")
         self.repo.git("merge", "-q", "--no-ff", "-m", "Octopus", "one", "two")
         code, out, err = self.repo.scan("--commit", "HEAD")
-        self.assertEqual(code, 2, out)
-        self.assertIn("octopus", err)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("(octopus merge):0 unreadable-change", out)
+        self.assertIn("octopus", out)
+        self.repo.git("commit", "-q", "--amend", "-m", f"Octopus\n\n{REASON}")
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("1 justified finding(s)", out)
 
     def test_a_git_without_remerge_diff_exits_2_and_names_the_version(self):
         self.branch_off()
@@ -1623,6 +1628,288 @@ class RepositoryHooks(unittest.TestCase):
             ["git", "push", "origin", "main"], cwd=self.repo.root, env=self.repo.env, capture_output=True, text=True
         )
         self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
+
+
+class PinnedGit(RepoCase):
+    """The diff the scanner reads must not depend on the clone it runs in: attributes, local
+    configuration and environment of the user are not part of the change under judgment."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.commit(tests__test_thing_py=BASE_TEST, tests__pkg__test_inner_py=BASE_TEST, src__a_py="x = 1\n")
+        self.skipped = skipped(BASE_TEST)
+
+    def findings(self, *scan_args, cwd=None):
+        code, out, err = self.repo.scan(*scan_args, "--json", cwd=cwd)
+        self.assertIn(code, (0, 1), out + err)
+        return code, {(f["path"], f["line"], f["rule"]) for f in json.loads(out)["findings"]}
+
+    SKIP_FOUND = (1, {("tests/test_thing.py", 4, "skip-added")})
+
+    def test_a_committed_gitattributes_cannot_hide_a_change_with_minus_diff(self):
+        self.repo.commit(**{"tests__.gitattributes": "*.py -diff\n"}, tests__test_thing_py=self.skipped)
+        self.assertEqual(self.findings("--commit", "HEAD"), (1, {("tests/test_thing.py", 4, "skip-added")}))
+
+    def test_attributes_only_in_the_local_info_file_cannot_hide_a_change_either(self):
+        self.repo.write(".git/info/attributes", "* -diff\n")
+        self.repo.write("tests/test_thing.py", self.skipped)
+        self.repo.git("add", "-A")
+        self.assertEqual(self.findings("--staged"), self.SKIP_FOUND)
+        self.repo.git("commit", "-q", "-m", "Park")
+        self.assertEqual(self.findings("--commit", "HEAD"), self.SKIP_FOUND)
+
+    def test_a_driver_that_marks_a_file_binary_cannot_hide_it(self):
+        self.repo.write(".git/info/attributes", "*.py diff=quiet\n")
+        self.repo.git("config", "diff.quiet.binary", "true")
+        self.repo.commit(tests__test_thing_py=self.skipped)
+        self.assertEqual(self.findings("--commit", "HEAD"), self.SKIP_FOUND)
+
+    def test_textconv_and_external_diff_drivers_cannot_hide_it(self):
+        self.repo.write(".git/info/attributes", "*.py diff=quiet\n")
+        for key in ("diff.quiet.textconv", "diff.quiet.command", "diff.external"):
+            with self.subTest(key=key):
+                self.repo.git("config", key, "true")
+                self.repo.commit(tests__test_thing_py=self.skipped)
+                self.assertEqual(self.findings("--commit", "HEAD"), self.SKIP_FOUND)
+                self.repo.git("config", "--unset", key)
+                self.repo.commit(tests__test_thing_py=BASE_TEST)
+
+    def conflicted_workflow(self):
+        """A merge of two sides that changed one CI line, resolved by keeping both."""
+        path = ".github__workflows__ci_yml"
+        self.repo.commit("Add the workflow", **{path: "steps:\n  - run: make test\n"})
+        base = self.repo.git("rev-parse", "HEAD")
+        self.repo.git("checkout", "-q", "-b", "side", base)
+        self.repo.commit("Side", **{path: "steps:\n  - run: make test-a\n"})
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("Main", **{path: "steps:\n  - run: make test-b\n"})
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", "side", check=False)
+        self.repo.commit("Merge side", **{path: "steps:\n  - run: make test-b\n  - run: make test-a\n"})
+
+    def test_the_conflict_style_a_user_configures_does_not_change_the_verdict_on_a_merge(self):
+        for style in ("merge", "diff3", "zdiff3"):
+            with self.subTest(style=style):
+                self.setUp()
+                self.repo.git("config", "merge.conflictStyle", style)
+                self.conflicted_workflow()
+                code, out, err = self.repo.scan("--commit", "HEAD")
+                self.assertEqual((code, out.strip()), (0, "check-integrity: ok (1 commits, 1 files)"), err)
+
+    def test_relative_paths_asked_for_in_the_configuration_do_not_change_the_paths(self):
+        self.repo.git("config", "diff.relative", "true")
+        self.repo.commit(tests__test_thing_py=self.skipped, src__a_py="x = f()  # noqa\n")
+        code, found = self.findings("--commit", "HEAD", cwd=self.repo.root / "tests")
+        self.assertEqual(
+            (code, {(path, rule) for path, _, rule in found}),
+            (1, {("tests/test_thing.py", "skip-added"), ("src/a.py", "suppression-added")}),
+        )
+
+    def test_the_scan_judges_the_same_from_a_subfolder_of_the_repository(self):
+        self.repo.commit(tests__test_thing_py=self.skipped)
+        self.repo.git("mv", "tests/pkg/test_inner.py", "tests/pkg/test_moved.py")
+        self.repo.write("tests/test_thing.py", BASE_TEST)
+        self.repo.git("add", "-A")
+        self.assertEqual(self.findings("--staged", cwd=self.repo.root / "tests" / "pkg"), (0, set()))
+        self.repo.git("commit", "-q", "-m", "Tidy")
+        self.repo.commit(tests__test_thing_py=self.skipped)
+        self.assertEqual(self.findings("--commit", "HEAD", cwd=self.repo.root / "src"), self.SKIP_FOUND)
+        self.assertEqual(self.findings("--range", "HEAD~1..HEAD", cwd=self.repo.root / "tests"), self.SKIP_FOUND)
+
+    def test_prefix_algorithm_and_hunk_settings_do_not_change_the_findings(self):
+        body = "".join(f"line {n}\n" for n in range(1, 30))
+        self.repo.commit(src__b_py=body, tests__test_other_py=BASE_TEST)
+        edited = body.replace("line 3\n", "line 3  # type: ignore\n").replace("line 6\n", "line 6  # noqa\n")
+        self.repo.commit(src__b_py=edited, tests__test_other_py=skipped(BASE_TEST))
+        expected = self.findings("--commit", "HEAD")
+        self.assertEqual(expected[0], 1)
+        for key, value in (
+            ("diff.noprefix", "true"),
+            ("diff.mnemonicPrefix", "true"),
+            ("diff.srcPrefix", "x/"),
+            ("diff.algorithm", "patience"),
+            ("diff.algorithm", "histogram"),
+            ("diff.interHunkContext", "8"),
+            ("diff.indentHeuristic", "false"),
+            ("core.quotePath", "true"),
+            ("diff.renames", "copies"),
+            ("log.showSignature", "true"),
+            ("color.ui", "always"),
+        ):
+            with self.subTest(key=key, value=value):
+                self.repo.git("config", key, value)
+                self.assertEqual(self.findings("--commit", "HEAD"), expected)
+                self.repo.git("config", "--unset", key)
+
+    def test_environment_variables_that_change_git_diff_are_not_passed_on(self):
+        self.repo.git("rm", "-q", "-r", "tests/pkg")
+        self.repo.commit(tests__pkg="now a file\n", tests__test_thing_py=self.skipped)
+        expected = self.findings("--commit", "HEAD")
+        self.assertEqual(
+            expected,
+            (1, {("tests/pkg/test_inner.py", 0, "test-removed"), ("tests/test_thing.py", 4, "skip-added")}),
+        )
+        for name, value in (
+            ("GIT_LITERAL_PATHSPECS", "1"),
+            ("GIT_GLOB_PATHSPECS", "1"),
+            ("GIT_NOGLOB_PATHSPECS", "1"),
+            ("GIT_ICASE_PATHSPECS", "1"),
+            ("GIT_EXTERNAL_DIFF", "true"),
+            ("GIT_DIFF_OPTS", "--unified=9"),
+        ):
+            with self.subTest(name=name):
+                self.repo.env[name] = value
+                self.assertEqual(self.findings("--commit", "HEAD"), expected)
+                del self.repo.env[name]
+
+
+class UnreadableChanges(RepoCase):
+    """What the scanner cannot read is a finding, never a crash (exit 2) and never a pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.commit(
+            tests__test_thing_py=BASE_TEST,
+            tests__pkg__test_inner_py=BASE_TEST,
+            docs__guide_md="# Guide\n",
+            src__a_py="x = 1\n",
+        )
+
+    def findings(self, *scan_args):
+        code, out, err = self.repo.scan(*scan_args, "--json")
+        self.assertIn(code, (0, 1), out + err)
+        return code, {(f["path"], f["rule"], f["justified"]) for f in json.loads(out)["findings"]}
+
+    def symlink(self, path, target="README.md"):
+        link = self.repo.root / path
+        link.unlink()
+        os.symlink(target, link)
+
+    def test_a_test_file_replaced_by_a_symlink_counts_as_a_deleted_test_in_every_mode(self):
+        self.symlink("tests/test_thing.py")
+        self.repo.git("add", "-A")
+        deleted = (1, {("tests/test_thing.py", "test-removed", False)})
+        self.assertEqual(self.findings("--staged"), deleted)
+        self.repo.git("commit", "-q", "-m", "Link the test")
+        self.assertEqual(self.findings("--commit", "HEAD"), deleted)
+        self.assertEqual(self.findings("--range", "HEAD~1..HEAD"), deleted)
+        self.repo.git("commit", "-q", "--amend", "-m", f"Link the test\n\n{REASON}")
+        self.assertEqual(self.findings("--commit", "HEAD"), (0, {("tests/test_thing.py", "test-removed", True)}))
+
+    def test_a_document_swapped_for_a_symlink_and_back_has_no_finding(self):
+        self.symlink("docs/guide.md")
+        self.repo.commit("Link the guide")
+        self.assertEqual(self.findings("--commit", "HEAD"), (0, set()))
+        (self.repo.root / "docs/guide.md").unlink()
+        self.repo.commit("A real guide again", docs__guide_md="# Guide\n")
+        self.assertEqual(self.findings("--commit", "HEAD"), (0, set()))
+
+    def test_a_file_replaced_by_a_directory_of_the_same_name_is_judged_file_by_file(self):
+        (self.repo.root / "tests/test_thing.py").unlink()
+        self.repo.write("tests/test_thing.py/inner.py", "y = f()  # type: ignore\n")
+        self.repo.write("tests/test_thing.py/notes.txt", "n\n")
+        self.repo.git("add", "-A")
+        expected = (
+            1,
+            {
+                ("tests/test_thing.py", "test-removed", False),
+                ("tests/test_thing.py/inner.py", "suppression-added", False),
+            },
+        )
+        self.assertEqual(self.findings("--staged"), expected)
+        self.repo.git("commit", "-q", "-m", "Make it a folder")
+        self.assertEqual(self.findings("--commit", "HEAD"), expected)
+
+    def test_a_file_that_git_sees_moved_into_the_directory_that_replaces_it_is_a_rename(self):
+        (self.repo.root / "tests/test_thing.py").unlink()
+        self.repo.write("tests/test_thing.py/test_inner.py", skipped(BASE_TEST))
+        self.repo.write("tests/test_thing.py/notes.txt", "n\n")
+        self.repo.commit("Move it inside")
+        self.assertEqual(
+            self.findings("--commit", "HEAD"), (1, {("tests/test_thing.py/test_inner.py", "skip-added", False)})
+        )
+
+    def test_a_directory_replaced_by_a_file_of_the_same_name_is_judged_file_by_file(self):
+        self.repo.git("rm", "-q", "-r", "tests/pkg")
+        self.repo.commit("Make it a file", **{"tests__pkg": "text\n"})
+        self.assertEqual(
+            self.findings("--commit", "HEAD"), (1, {("tests/pkg/test_inner.py", "test-removed", False)})
+        )
+
+    def gitlink(self, path="libs/vendored"):
+        self.repo.git("update-index", "--add", "--cacheinfo", f"160000,{self.repo.git('rev-parse', 'HEAD')},{path}")
+        self.repo.git("commit", "-q", "-m", "Touch the submodule")
+
+    def test_a_submodule_added_bumped_or_removed_is_an_unreadable_change(self):
+        for step in ("add", "bump", "remove"):
+            with self.subTest(step=step):
+                if step == "add":
+                    self.gitlink()
+                elif step == "bump":
+                    self.repo.commit("Another commit")
+                    self.gitlink()
+                else:
+                    self.repo.git("rm", "-q", "--cached", "libs/vendored")
+                    self.repo.git("commit", "-q", "-m", "Drop the submodule")
+                self.assertEqual(
+                    self.findings("--commit", "HEAD"), (1, {("libs/vendored", "unreadable-change", False)})
+                )
+        self.repo.git("commit", "-q", "--amend", "-m", f"Drop the submodule\n\n{REASON}")
+        self.assertEqual(
+            self.findings("--commit", "HEAD"), (0, {("libs/vendored", "unreadable-change", True)})
+        )
+
+    def git_shim(self, script):
+        """A ``git`` ahead of the real one on PATH. It stands in for a git whose patch the
+        scanner cannot read: the output below is a guess at such a patch, not a recording."""
+        shim = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-shim"
+        shim.mkdir()
+        self.addCleanup(lambda: shutil.rmtree(shim, ignore_errors=True))
+        (shim / "git").write_text(
+            "#!/bin/sh\n"
+            'case " $* " in\n'
+            '  *" -p "*"literal)docs/guide.md"*)\n'
+            f"{script}\n"
+            "    exit 0;;\n"
+            "esac\n"
+            f'exec {shlex.quote(shutil.which("git"))} "$@"\n'
+        )
+        (shim / "git").chmod(0o755)
+        self.repo.env["PATH"] = f"{shim}{os.pathsep}{self.repo.env['PATH']}"
+
+    def test_a_patch_that_does_not_parse_is_a_finding_on_that_file_only(self):
+        self.repo.commit(docs__guide_md="# Guide\nmore\n", src__a_py="x = f()  # noqa\n")
+        self.git_shim("    printf 'diff --git a/docs/guide.md b/docs/guide.md\\n@@ nonsense @@\\n'")
+        code, found = self.findings("--commit", "HEAD")
+        self.assertEqual(
+            (code, found),
+            (1, {("docs/guide.md", "unreadable-change", False), ("src/a.py", "suppression-added", False)}),
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertIn("docs/guide.md:0 unreadable-change", out)
+        self.assertIn("cannot parse diff of docs/guide.md", out)
+        self.repo.git("commit", "-q", "--amend", "-m", f"Edit\n\n{REASON}")
+        self.assertEqual(self.findings("--commit", "HEAD")[0], 0)
+
+    def test_a_patch_holding_more_than_one_file_is_unreadable_even_if_it_would_parse(self):
+        self.repo.commit(docs__guide_md="# Guide\nmore\n")
+        self.git_shim(
+            "    printf 'diff --git a/docs/guide.md b/docs/guide.md\\nold mode 100644\\nnew mode 100755\\n"
+            "diff --git a/docs/other.md b/docs/other.md\\n@@ -0,0 +1 @@\\n+x\\n'"
+        )
+        self.assertEqual(
+            self.findings("--commit", "HEAD"), (1, {("docs/guide.md", "unreadable-change", False)})
+        )
+
+    def test_the_overlay_cannot_lower_the_unreadable_change_rule(self):
+        overlay = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-overlay.json"
+        self.addCleanup(lambda: overlay.unlink(missing_ok=True))
+        for change in ({"severity": "note"}, {"allow": ["x"]}, {"exempt_paths": ["*"]}):
+            with self.subTest(change=change):
+                overlay.write_text(json.dumps({"rules": {"unreadable-change": change}}))
+                code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(overlay))
+                self.assertEqual(code, 2, out)
+                self.assertIn("unreadable-change", err)
+                self.assertIn("cannot", err)
 
 
 if __name__ == "__main__":

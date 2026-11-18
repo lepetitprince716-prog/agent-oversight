@@ -12,15 +12,24 @@ paths in its own ``.check-integrity.json`` (see ``load_overlay``); any change to
 itself a blocking finding (rule ``overlay-changed``). A merge commit is judged by what the
 merge changed beyond the automatic merge (``git show --remerge-diff``, git 2.36 or newer).
 
+Every git call pins the configuration, attributes and environment that change diff text
+(``GIT_CONFIG``, ``GIT_ENV_DROP``, ``DIFF_FLAGS``), so the verdict does not depend on the clone
+it runs in. A change the scanner cannot read (a patch it cannot parse, a submodule, an octopus
+merge) is a blocking finding, rule ``unreadable-change``: never a pass and never a crash. A file
+whose type changes (a regular file becomes a symbolic link, or the reverse) counts as the old
+file deleted; the new side is not judged.
+
 Exit status: 0 no blocking finding, or every one justified; 1 an unjustified blocking
-finding; 2 usage or git error. The guard fails closed: an unreadable rules file, a failed git call or a
-diff it cannot parse is an error, never a pass. Standard library only; one file, so it
-can be copied into another repository together with its rules file.
+finding; 2 a usage error, a revision that does not exist, a missing or too old git, a git call
+that fails, a broken rules file or a broken overlay file. The guard fails closed. Standard
+library only; one file, so it can be copied into another repository together with its rules
+file.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import fnmatch
 import functools
 import json
@@ -60,7 +69,13 @@ OVERLAY_RULE_KEYS = frozenset({"severity", "allow", "exempt_paths"})
 # A change to the overlay file is judged by the scanner itself, not by a rule of the rules
 # file, and the overlay cannot touch it: otherwise a commit could loosen its own judge.
 OVERLAY_GUARD = "overlay-changed"
+# A change the scanner cannot read is judged by the scanner itself too, and the overlay cannot
+# lower it: a diff that could not be read must never pass for one that has nothing in it.
+UNREADABLE = "unreadable-change"
+BUILTIN_RULES = (OVERLAY_GUARD, UNREADABLE)
 REMERGE_DIFF_GIT = (2, 36)
+GITLINK = b"160000"  # the mode of a submodule entry
+OCTOPUS_PATH = "(octopus merge)"  # stands in for the path of a change that has none
 # The conflict markers a merge resolution removes; they are not content the author dropped.
 CONFLICT_MARKER = re.compile(r"^(<{7}|>{7}|\|{7})( .*)?$|^={7}$")
 
@@ -179,6 +194,8 @@ def compile_rule(raw: object, where: str, known: set[str]) -> Rule:
     if not isinstance(classes, list) or not classes or not set(classes) <= known:
         raise IntegrityError(f"{where}: classes must be a non-empty list of names from 'classes'")
     patterns = compile_list(raw.get("patterns", []), f"{where} patterns")
+    if raw["id"] in BUILTIN_RULES:
+        raise IntegrityError(f"{where}: {raw['id']} is the scanner's own rule and cannot be defined here")
     if raw["kind"] != "deleted" and not patterns:
         raise IntegrityError(f"{where}: kind {raw['kind']} needs patterns")
     flags = {key: raw.get(key, False) for key in ("existing_only", "spare_with_source")}
@@ -259,6 +276,10 @@ def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
             raise IntegrityError(
                 f"{where}: the overlay cannot change this rule; any change to {OVERLAY_NAME} needs a reason line"
             )
+        if rule_id == UNREADABLE:
+            raise IntegrityError(
+                f"{where}: the overlay cannot change this rule; a change the scanner cannot read always needs a reason line"
+            )
         if rule_id not in known:
             raise IntegrityError(f"{where}: no such rule (known: {', '.join(sorted(known))})")
         if not isinstance(change, dict) or set(change) - OVERLAY_RULE_KEYS:
@@ -307,12 +328,16 @@ class Line(NamedTuple):
 @dataclass
 class FileDiff:
     """One changed file. ``status`` is A (added, or copied), M, D or R (renamed from
-    ``old_path``); a rename's lines are only the changes made on top of the move."""
+    ``old_path``); a rename's lines are only the changes made on top of the move. A file that
+    changed type has status D and ``typechange``: only its old side is judged. ``unreadable``
+    says why the scanner could not read the change; such a file has no lines."""
 
     path: str
     status: str = "M"
     old_path: str | None = None
     binary: bool = False
+    typechange: bool = False
+    unreadable: str | None = None
     added: list[Line] = field(default_factory=list)
     removed: list[Line] = field(default_factory=list)
 
@@ -384,13 +409,55 @@ def parse_patch(
 # --- git -----------------------------------------------------------------------------
 
 
-def git(args: list[str]) -> bytes:
-    """Run git with an argument list; any failure is an IntegrityError."""
-    command = ["git", "--literal-pathspecs", "-c", "core.quotePath=false", *args]
+# Configuration that changes the text of a diff, the files it lists or the automatic merge a
+# merge commit is compared with. Each entry is passed as ``git -c``, which beats the
+# repository's, the user's and the system's configuration and ``GIT_CONFIG_*`` alike. Entries
+# that a command line flag of DIFF_FLAGS already pins (colour, renames) are not repeated.
+GIT_CONFIG = (
+    "core.quotePath=false",
+    "merge.conflictStyle=merge",
+    "merge.renames=true",
+    "merge.directoryRenames=conflict",
+    "merge.renameLimit=7000",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+    "diff.srcPrefix=a/",
+    "diff.dstPrefix=b/",
+    "diff.algorithm=myers",
+    "diff.indentHeuristic=true",
+    "diff.interHunkContext=0",
+    "diff.relative=false",
+    "diff.renameLimit=1000",
+    "color.ui=false",
+    "log.showSignature=false",
+)
+# Environment variables that change diff text or turn the pathspecs of a call into something
+# else; they are removed before git runs. ``-c`` already beats the configuration variables.
+GIT_ENV_DROP = frozenset(
+    {
+        "GIT_DIFF_OPTS",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    }
+)
+
+
+def run_git(args: list[str], stdin: bytes = b"") -> subprocess.CompletedProcess[bytes]:
+    """Run git with the pinned configuration and environment; only a missing git raises."""
+    command = ["git", *(part for setting in GIT_CONFIG for part in ("-c", setting)), *args]
+    env = {key: value for key, value in os.environ.items() if key not in GIT_ENV_DROP}
     try:
-        done = subprocess.run(command, capture_output=True, check=False)
+        return subprocess.run(command, input=stdin, capture_output=True, check=False, env=env)
     except OSError as exc:
         raise IntegrityError(f"cannot run git: {exc}") from exc
+
+
+def git(args: list[str]) -> bytes:
+    """Run git with an argument list; any failure is an IntegrityError."""
+    done = run_git(args)
     if done.returncode != 0:
         detail = done.stderr.decode("utf-8", "replace").strip()
         raise IntegrityError(f"git {args[0]} failed: {detail}")
@@ -398,17 +465,35 @@ def git(args: list[str]) -> bytes:
 
 
 # Renames are found explicitly, whatever diff.renames says: a moved file is judged by the
-# changes made on top of the move, not as a deletion plus an addition.
-DIFF_FLAGS = ["--find-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"]
+# changes made on top of the move, not as a deletion plus an addition. ``--text`` makes git
+# print a patch for a file its attributes (``-diff``, a driver with ``binary``) or its content
+# call binary, so a repository's attributes cannot hide lines from the scan.
+DIFF_FLAGS = [
+    "--find-renames",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--text",
+    "--ignore-submodules=none",
+]
 
 
-def changed_files(command: list[str], base: list[str]) -> list[tuple[str, str, str | None]]:
-    """``(status, path, old_path)`` for each changed file, from ``git <command> --raw -z``.
-    A rename carries its old path; a copy counts as an added file."""
+class Change(NamedTuple):
+    """One line of ``git diff --raw``: ``old_path`` only for a rename."""
+
+    status: str
+    path: str
+    old_path: str | None
+    old_mode: bytes
+    new_mode: bytes
+
+
+def changed_files(command: list[str], base: list[str]) -> list[Change]:
+    """Each changed file, from ``git <command> --raw -z``. A copy counts as an added file."""
     fields = git([*command, "--raw", "-z", *DIFF_FLAGS, *base]).split(b"\0")
     if fields and fields[-1] == b"":
         fields.pop()
-    files: list[tuple[str, str, str | None]] = []
+    files: list[Change] = []
     index = 0
     while index < len(fields):
         meta = fields[index]
@@ -421,29 +506,61 @@ def changed_files(command: list[str], base: list[str]) -> list[tuple[str, str, s
         if len(paths) != count:
             raise IntegrityError("cannot parse the list of changed files from git")
         index += 1 + count
+        modes = (parts[0][1:], parts[1])
         if status == "R":
-            files.append(("R", paths[1], paths[0]))
+            files.append(Change("R", paths[1], paths[0], *modes))
         elif status == "C":
-            files.append(("A", paths[1], None))
+            files.append(Change("A", paths[1], None, *modes))
         else:
-            files.append((status, paths[0], None))
+            files.append(Change(status, paths[0], None, *modes))
     return files
 
 
+def pathspecs(paths: list[str], names: list[str]) -> list[str]:
+    """Literal pathspecs, from the top of the repository wherever the scan runs, for the files
+    of one change; ``names`` is every path of the whole diff, sorted. A path also names a directory in git's pathspecs, so when a file and a
+    directory of one name swap places, the patch of the file would hold the directory's files
+    too: those are excluded one by one, and the patch of one file holds that file alone."""
+    specs = [f":(top,literal){path}" for path in paths]
+    for path in paths:
+        first = bisect.bisect_left(names, path + "/")
+        last = bisect.bisect_left(names, path + "0")  # "0" is the character after "/"
+        specs += [f":(top,exclude,literal){name}" for name in names[first:last] if name not in paths]
+    return specs
+
+
+def read_change(command: list[str], base: list[str], change: Change, merge: bool, names: list[str]) -> FileDiff:
+    """The lines of one changed file. What cannot be read comes back as a FileDiff with
+    ``unreadable`` set, so the change becomes a finding instead of ending the run."""
+    status, path, old_path = change.status, change.path, change.old_path
+    if GITLINK in (change.old_mode, change.new_mode):
+        return FileDiff(path, status, old_path, unreadable="a submodule changed")
+    if status in ("U", "X"):
+        return FileDiff(path, status, old_path, unreadable=f"git reports status {status} for this path")
+    if status == "T":
+        return FileDiff(path, "D", typechange=True)
+    spec = pathspecs([old_path, path] if old_path else [path], names)
+    patch = git([*command, "-p", "-U0", *DIFF_FLAGS, *base, "--", *spec])
+    sections = sum(1 for line in patch.split(b"\n") if line.startswith(b"diff --git "))
+    if sections != 1:
+        return FileDiff(path, status, old_path, unreadable=f"git gave {sections} file patches for this one file")
+    try:
+        diff = parse_patch(path, patch, status=status, old_path=old_path)
+    except IntegrityError as exc:
+        return FileDiff(path, status, old_path, unreadable=str(exc))
+    if merge:
+        diff.removed = [line for line in diff.removed if not CONFLICT_MARKER.match(line.text)]
+    return diff
+
+
 def collect(base: list[str], merge: bool = False) -> list[FileDiff]:
-    """Parse every changed file of one diff, one git call per file. ``merge`` is for the one
+    """Read every changed file of one diff, one git call per file. ``merge`` is for the one
     id of a merge commit: its diff is what the merge changed beyond the automatic merge, with
     the conflict markers that the resolution removed left out."""
     command = ["show", "--format=", "--remerge-diff"] if merge else ["diff"]
-    diffs = []
-    for status, path, old_path in changed_files(command, base):
-        paths = [old_path, path] if old_path else [path]
-        patch = git([*command, "-p", "-U0", *DIFF_FLAGS, *base, "--", *paths])
-        diff = parse_patch(path, patch, status=status, old_path=old_path)
-        if merge:
-            diff.removed = [line for line in diff.removed if not CONFLICT_MARKER.match(line.text)]
-        diffs.append(diff)
-    return diffs
+    changes = changed_files(command, base)
+    names = sorted({name for change in changes for name in (change.path, change.old_path) if name})
+    return [read_change(command, base, change, merge, names) for change in changes]
 
 
 @functools.lru_cache(maxsize=1)
@@ -461,15 +578,7 @@ def require_remerge_diff() -> None:
 
 def empty_tree() -> str:
     """The id of the empty tree in this repository's hash (sha1 or sha256)."""
-    try:
-        done = subprocess.run(
-            ["git", "hash-object", "-t", "tree", "--stdin"],
-            input=b"",
-            capture_output=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise IntegrityError(f"cannot run git: {exc}") from exc
+    done = run_git(["hash-object", "-t", "tree", "--stdin"])
     if done.returncode != 0:
         raise IntegrityError(f"git hash-object failed: {done.stderr.decode('utf-8', 'replace').strip()}")
     return done.stdout.decode("ascii").strip()
@@ -486,10 +595,8 @@ def collect_commit(oid: str) -> list[FileDiff]:
     commit, and for a merge commit against the automatic merge of its parents."""
     parents = git(["rev-list", "--parents", "-n", "1", oid]).decode().split()[1:]
     if len(parents) > 2:
-        raise IntegrityError(
-            f"{oid[:SHORT]} is an octopus merge ({len(parents)} parents): git has no --remerge-diff for it, "
-            "so it cannot be judged"
-        )
+        reason = f"an octopus merge ({len(parents)} parents): git has no --remerge-diff for it"
+        return [FileDiff(OCTOPUS_PATH, unreadable=reason)]
     if len(parents) == 2:
         require_remerge_diff()
         return collect([oid], merge=True)
@@ -510,11 +617,7 @@ OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def has_commit(oid: str) -> bool:
-    try:
-        done = subprocess.run(["git", "cat-file", "-e", f"{oid}^{{commit}}"], capture_output=True, check=False)
-    except OSError as exc:
-        raise IntegrityError(f"cannot run git: {exc}") from exc
-    return done.returncode == 0
+    return run_git(["cat-file", "-e", f"{oid}^{{commit}}"]).returncode == 0
 
 
 def push_commits(refs: str) -> list[str]:
@@ -666,6 +769,8 @@ def net_loss_hits(diffs: list[FileDiff], rule: Rule, rules: RuleSet) -> list[Hit
 
 def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hit]:
     """Every per-file rule that fires on one file; ``diffs`` is the whole change."""
+    if diff.unreadable:
+        return []  # reported by unreadable_hits, not by the rules
     classes = rules.classes_of(diff.path)
     hits: list[Hit] = []
     for rule in rules.rules:
@@ -673,7 +778,7 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
             continue
         if rule.kind == "deleted":
             if gone(diff, rule, rules) and not (rule.spare_with_source and spared(diff, diffs)):
-                hits.append(Hit(diff.path, 0, rule.id, "(file deleted)"))
+                hits.append(Hit(diff.path, 0, rule.id, "(file type changed)" if diff.typechange else "(file deleted)"))
             continue
         if diff.deleted or rule.kind == "net-loss" or not classes.intersection(rule.classes):
             continue  # a deleted file is judged by its deletion alone
@@ -703,9 +808,16 @@ def overlay_hits(diffs: list[FileDiff]) -> list[Hit]:
     return hits
 
 
+def unreadable_hits(diffs: list[FileDiff]) -> list[Hit]:
+    """One hit for each file whose change the scanner could not read. Such a change is never
+    judged by the other rules, and never passes for an empty one."""
+    return [Hit(diff.path, 0, UNREADABLE, diff.unreadable) for diff in diffs if diff.unreadable]
+
+
 def judge_change(diffs: list[FileDiff], rules: RuleSet) -> list[Hit]:
     """Every rule that fires on one change, in diff order; a rule fires once per line."""
-    hits = [hit for diff in diffs for hit in judge_file(diff, diffs, rules)] + overlay_hits(diffs)
+    hits = [hit for diff in diffs for hit in judge_file(diff, diffs, rules)]
+    hits += overlay_hits(diffs) + unreadable_hits(diffs)
     for rule in rules.rules:
         if rule.kind == "net-loss":
             hits += net_loss_hits(diffs, rule, rules)
