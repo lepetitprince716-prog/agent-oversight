@@ -289,6 +289,64 @@ class TestRemoved(RepoCase):
         code, out, _ = self.repo.scan("--commit", "HEAD")
         self.assertEqual(code, 0, out)
 
+    def test_deleting_a_python_function_that_is_not_a_test_is_green_but_deleting_a_test_is_red(self):
+        # none of the deleted bodies holds an assertion line, so only test-removed can fire
+        with_helpers = (
+            "import unittest\n"
+            "\n"
+            "class TestThing(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.value = 1\n"
+            "\n"
+            "    def helper(self):\n"
+            "        return self.value\n"
+            "\n"
+            "    def test_one(self):\n"
+            "        self.assertEqual(f(), 1)\n"
+            "\n"
+            "    def test_two(self):\n"
+            "        pass\n"
+        )
+        self.repo.commit(tests__test_thing_py=with_helpers)
+        without_helpers = with_helpers.replace(
+            "    def setUp(self):\n        self.value = 1\n\n", ""
+        ).replace("    def helper(self):\n        return self.value\n\n", "")
+        self.assertNotEqual(without_helpers, with_helpers)
+        self.assertNotIn("def helper", without_helpers)
+        self.assertNotIn("def setUp", without_helpers)
+        self.repo.commit(tests__test_thing_py=without_helpers)
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.repo.commit(
+            tests__test_thing_py=without_helpers.replace("\n    def test_two(self):\n        pass\n", "")
+        )
+        self.assertEqual(
+            {(path, rule) for path, _, rule, _ in self.rules_at_head()}, {("tests/test_thing.py", "test-removed")}
+        )
+
+    def test_deleting_a_go_function_that_is_not_a_test_is_green_but_deleting_a_test_is_red(self):
+        with_helper = (
+            "package pkg\n"
+            "\n"
+            "func helper() int {\n"
+            "\treturn 1\n"
+            "}\n"
+            "\n"
+            "func TestOne(t *testing.T) {}\n"
+            "\n"
+            "func TestTwo(t *testing.T) {}\n"
+        )
+        self.repo.commit(pkg__b_test_go=with_helper)
+        without_helper = with_helper.replace("func helper() int {\n\treturn 1\n}\n\n", "")
+        self.assertNotIn("func helper", without_helper)
+        self.repo.commit(pkg__b_test_go=without_helper)
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.repo.commit(pkg__b_test_go=without_helper.replace("\nfunc TestTwo(t *testing.T) {}\n", ""))
+        self.assertEqual(
+            {(path, rule) for path, _, rule, _ in self.rules_at_head()}, {("pkg/b_test.go", "test-removed")}
+        )
+
     def test_js_and_go_definitions_count(self):
         self.repo.commit(
             **{"web/a.test.ts": "it('one', () => {})\ntest('two', () => {})\n"},
