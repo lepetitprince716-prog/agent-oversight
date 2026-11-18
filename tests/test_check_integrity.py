@@ -1845,18 +1845,64 @@ class Overlay(RepoCase):
         )
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-    def test_a_broken_explicit_overlay_exits_2_and_says_why(self):
+    def test_a_broken_explicit_overlay_warns_and_makes_every_rule_block(self):
+        """--overlay is handed the baseline's file by CI, so a broken one is treated as a broken
+        overlay in the baseline is: one warning, every rule blocks, the exit code is the findings'."""
         self.skip_commit()
         path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-broken-overlay.json"
         self.addCleanup(lambda: path.unlink(missing_ok=True))
         for text, expected in BROKEN_OVERLAYS.items():
             with self.subTest(overlay=text):
+                self.repo.git("commit", "-q", "--amend", "-m", "Park a test")
                 path.write_text(text)
                 code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(path))
-                self.assertEqual(code, 2, out + err)
+                self.assertEqual(code, 1, out + err)  # the skip has no reason line
+                self.assertEqual(len(err.strip().splitlines()), 1, err)
+                self.assertIn("warning", err)
                 self.assertIn(expected, err)
+                self.assertIn("every rule is judged as block", err)
                 code, out, _ = self.repo.scan("--commit", "HEAD", "--overlay", str(path), "--json")
-                self.assertEqual((code, json.loads(out)["status"]), (2, "error"))
+                report = json.loads(out)
+                self.assertEqual((code, report["status"]), (1, "findings"))
+                self.assertEqual([(f["rule"], f["severity"]) for f in report["findings"]], [("skip-added", "block")])
+                self.repo.git("commit", "-q", "--amend", "-m", f"Park a test\n\n{REASON}")
+                code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(path))
+                self.assertEqual(code, 0, out + err)  # justified: the warning is not an error
+                self.assertIn("warning", err)
+
+    def test_an_explicit_overlay_that_is_not_a_regular_utf8_file_is_invalid_too(self):
+        self.skip_commit()
+        binary = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-binary-overlay.json"
+        self.addCleanup(lambda: binary.unlink(missing_ok=True))
+        binary.write_bytes(b'{"version": 1, "rules": {"skip-added": {"allow": ["\xff"]}}}')
+        for what, path in (("a directory", Path(self._tmp.name)), ("bytes that are not UTF-8", binary)):
+            with self.subTest(what):
+                code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(path))
+                self.assertEqual(code, 1, out + err)
+                self.assertEqual(len(err.strip().splitlines()), 1, err)
+                self.assertIn("warning", err)
+                self.assertIn("every rule is judged as block", err)
+
+    def test_an_explicit_overlay_that_cannot_be_read_is_a_usage_error(self):
+        """A path that is not there, or that the process may not read, says nothing about the
+        file CI means: that stays exit 2."""
+        self.skip_commit()
+        path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-unreadable-overlay.json"
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(path))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("cannot read", err)
+        path.write_text(json.dumps(NOTE_SKIPS))
+        path.chmod(0)
+        try:
+            path.read_bytes()
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("this account can read a file with mode 000 (root?)")
+        code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(path))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("cannot read", err)
 
     def test_no_overlay_and_explicit_overlay(self):
         self.overlay("{not json")
@@ -2025,14 +2071,18 @@ class OverlayGuard(RepoCase):
     def test_the_overlay_cannot_change_that_rule(self):
         explicit = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-guard-overlay.json"
         self.addCleanup(lambda: explicit.unlink(missing_ok=True))
+        seed = self.repo.git("rev-parse", "HEAD")  # its tautology is a finding whatever the overlay says
         for change in ({"severity": "note"}, {"allow": ["x"]}, {"exempt_paths": [".check-integrity.json"]}):
             with self.subTest(change=change):
                 text = json.dumps({"rules": {"overlay-changed": change}})
                 explicit.write_text(text)
-                code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(explicit))
-                self.assertEqual(code, 2, out)
+                # the overlay is rejected, so nothing it says takes effect: the finding stands
+                code, out, err = self.repo.scan("--commit", seed, "--overlay", str(explicit))
+                self.assertEqual(code, 1, out)
+                self.assertIn("tautology-added", out)
                 self.assertIn("overlay-changed", err)
                 self.assertIn("cannot", err)
+                self.assertIn("every rule is judged as block", err)
                 # committed, it is a broken overlay of the baseline of the next commit: warned
                 # about, applied as nothing, and the next commit is still judged
                 self.repo.commit("Set the overlay", **{self.OVERLAY: text})
@@ -2469,6 +2519,52 @@ class CiScanStep(unittest.TestCase):
         code, out = self.run_step(AFTER="f" * 40)
         self.assertEqual(code, 2, out)
         self.assertNotIn("::warning::", out)
+
+    def assert_passes_everywhere(self, tip, base):
+        """Exit 0 for every way in, with the scanner's warning about the overlay in the output."""
+        for kind, (origin_main, variables) in self.entries(tip, base).items():
+            with self.subTest(kind):
+                result, out = self.outcome(kind, origin_main, variables)
+                self.assertEqual(result, "passed", out)
+                self.assertIn("warning", out)
+                self.assertIn("every rule is judged as block", out)
+
+    def judge_by_a_broken_overlay(self, break_it):
+        """The default branch holds an overlay file that cannot be used (the step hands it to the
+        scanner with --overlay). A change that repairs it, and one that does not touch it and has
+        nothing to report, must still pass; a skip with no reason line must still be stopped."""
+        self.repo.git("checkout", "-q", "-b", "trunk", self.base_sha)
+        break_it()
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", f"Break the overlay\n\n{REASON}")
+        trunk = self.repo.git("rev-parse", "HEAD")
+        # the repair: the broken file (a link, too) goes, a valid one takes its place
+        self.repo.git("checkout", "-q", "-b", "repair", trunk)
+        self.repo.git("rm", "-q", "--", self.OVERLAY)
+        repair = self.repo.commit(f"Fix the overlay\n\n{REASON}", **{self.OVERLAY: self.RELAXED})
+        self.assert_passes_everywhere(repair, trunk)
+        # a change that has nothing to report
+        self.repo.git("checkout", "-q", "-b", "unrelated", trunk)
+        note = self.repo.commit("Add a note", notes_txt="x\n")
+        self.assert_passes_everywhere(note, trunk)
+        # a skip with no reason line
+        _, tip = self.feature(base=trunk)
+        self.assert_blocked_everywhere(tip, trunk)
+        for kind, (origin_main, variables) in self.entries(tip, trunk).items():
+            with self.subTest(kind):
+                _, out = self.outcome(kind, origin_main, variables)
+                self.assertIn("every rule is judged as block", out)
+
+    def test_an_overlay_with_a_misspelled_key_on_the_default_branch_does_not_block_the_step(self):
+        text = json.dumps({"version": 1, "rules": {"skip-added": {"sevrity": "note"}}})
+        self.judge_by_a_broken_overlay(lambda: self.repo.write(self.OVERLAY, text))
+
+    def test_an_overlay_naming_a_rule_that_does_not_exist_on_the_default_branch_does_not_block_the_step(self):
+        text = json.dumps({"version": 1, "rules": {"no-such-rule": {"severity": "note"}}})
+        self.judge_by_a_broken_overlay(lambda: self.repo.write(self.OVERLAY, text))
+
+    def test_an_overlay_that_is_a_symbolic_link_on_the_default_branch_does_not_block_the_step(self):
+        self.judge_by_a_broken_overlay(lambda: os.symlink("elsewhere.json", self.repo.root / self.OVERLAY))
 
     def test_the_first_push_to_the_default_branch_has_nothing_to_scan(self):
         for label, before in (("first push", self.ZERO), ("force push", self.UNKNOWN)):
@@ -2928,6 +3024,164 @@ class PinnedGit(RepoCase):
                 self.assertEqual(self.findings("--commit", "HEAD"), expected)
                 self.repo.git("config", "--unset", key)
 
+    BLANKS_BEFORE = {
+        "docs__a_md": "one\n\ntwo\n",
+        "src__b_py": "".join(f"line {n}\n" for n in range(1, 13)),
+        "src__ord_a_py": "a = 1\n",
+        "src__ord_z_py": "z = 1\n",
+    }
+
+    def blank_context_change(self):
+        """One commit with a skip (block), suppressions (notes) in several files, and unchanged
+        blank lines inside the context of the changes; then a second such change staged on top."""
+        self.repo.commit(**self.BLANKS_BEFORE)
+        body = self.BLANKS_BEFORE["src__b_py"]
+        self.repo.commit(
+            docs__a_md="one\n\ntwo\nthree\n",
+            src__b_py=body.replace("line 3\n", "line 3  # noqa\n\nline 3b\n"),
+            src__ord_a_py="a = 1  # noqa\n",
+            src__ord_z_py="z = 1  # noqa\n",
+            tests__test_thing_py=self.skipped,
+        )
+        self.repo.write("tests/pkg/test_inner.py", self.skipped)
+        self.repo.write("docs/a.md", "one\n\ntwo\nthree\nfour\n")
+        self.repo.write("src/b.py", body.replace("line 3\n", "line 3  # noqa\n\nline 3b\n").replace("line 9\n", "\nline 9  # type: ignore\n"))
+        self.repo.git("add", "-A")
+
+    def reports(self):
+        """The whole --json output and exit code of the last commit and of the staged change."""
+        return {
+            "commit": self.repo.scan("--commit", "HEAD", "--json"),
+            "staged": self.repo.scan("--staged", "--json"),
+        }
+
+    def test_a_hostile_local_setting_does_not_change_the_json_report(self):
+        order_file = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-order.txt"
+        order_file.write_text("src/ord_z.py\nsrc/ord_a.py\n", encoding="utf-8")
+        self.addCleanup(order_file.unlink)
+        self.blank_context_change()
+        expected = self.reports()
+        for where, (code, out, err) in expected.items():
+            self.assertEqual((code, err), (1, ""), where + out)
+            self.assertEqual(
+                {(f["rule"], f["severity"]) for f in json.loads(out)["findings"]},
+                {("skip-added", "block"), ("suppression-added", "note")},
+                where,
+            )
+        hostile = (
+            ("diff.suppressBlankEmpty", "true"),
+            ("diff.noprefix", "true"),
+            ("diff.mnemonicPrefix", "true"),
+            ("diff.srcPrefix", "x/"),
+            ("diff.dstPrefix", "y/"),
+            ("diff.context", "0"),
+            ("diff.context", "20"),
+            ("diff.interHunkContext", "5"),
+            ("diff.renames", "false"),
+            ("diff.renames", "copies"),
+            ("diff.renameLimit", "1"),
+            ("diff.algorithm", "patience"),
+            ("diff.algorithm", "histogram"),
+            ("diff.algorithm", "minimal"),
+            ("diff.indentHeuristic", "false"),
+            ("diff.orderFile", str(order_file)),
+            ("diff.colorMoved", "zebra"),
+            ("diff.wsErrorHighlight", "all"),
+            ("diff.submodule", "log"),
+            ("color.diff", "always"),
+            ("color.ui", "always"),
+            ("core.quotePath", "false"),
+            ("core.quotePath", "true"),
+            ("core.abbrev", "4"),
+            ("core.bigFileThreshold", "1"),
+            ("core.autocrlf", "true"),
+            ("core.whitespace", "trailing-space"),
+            ("core.pager", "false"),
+            ("merge.conflictStyle", "zdiff3"),
+            ("merge.renames", "false"),
+            ("merge.renormalize", "true"),
+            ("log.showSignature", "true"),
+            ("log.diffMerges", "separate"),
+            ("i18n.logOutputEncoding", "ISO-8859-1"),
+            ("format.pretty", "oneline"),
+        )
+        for key, value in hostile:
+            with self.subTest(key=key, value=value):
+                self.repo.git("config", key, value)
+                try:
+                    self.assertEqual(self.reports(), expected)
+                finally:
+                    self.repo.git("config", "--unset", key)
+
+    def test_git_prints_the_space_of_a_blank_context_line_whatever_the_configuration_says(self):
+        self.repo.commit(docs__a_md="one\n\ntwo\n")
+        self.repo.commit(docs__a_md="one\n\ntwo\nthree\n")
+        self.repo.git("config", "diff.suppressBlankEmpty", "true")
+        plain = subprocess.run(
+            ["git", "-C", str(self.repo.root), "diff", "-U3", "HEAD~1", "HEAD"],
+            env=self.repo.env, capture_output=True, check=True,
+        ).stdout
+        self.assertIn(b" one\n\n two\n", plain, "the setting must act on a plain git diff for this test to mean anything")
+        pinned = ci.run_git(["-C", str(self.repo.root), "diff", "-U3", "HEAD~1", "HEAD"]).stdout
+        self.assertIn(b" one\n \n two\n", pinned)
+
+    def test_a_patch_with_blank_context_lines_that_lost_their_space_still_parses(self):
+        header = b"diff --git a/docs/a.md b/docs/a.md\nindex 1111111..2222222 100644\n--- a/docs/a.md\n+++ b/docs/a.md\n"
+        for label, hunk, added in (
+            ("blank line in the middle", b"@@ -1,3 +1,4 @@\n one\n\n two\n+three\n", [(4, "three")]),
+            ("blank line last in the hunk", b"@@ -1,3 +1,4 @@\n one\n+new\n two\n\n", [(2, "new")]),
+            ("blank line first in the hunk", b"@@ -1,3 +1,4 @@\n\n one\n+new\n two\n", [(3, "new")]),
+            ("a blank line with its space", b"@@ -1,3 +1,4 @@\n one\n \n two\n+three\n", [(4, "three")]),
+        ):
+            with self.subTest(label):
+                diff = ci.parse_patch("docs/a.md", header + hunk)
+                self.assertEqual([(line.number, line.text) for line in diff.added], added)
+                self.assertEqual(diff.removed, [])
+
+    def test_a_local_replace_ref_does_not_change_what_the_scanner_reads(self):
+        self.repo.commit(src__b_py="x = f()  # noqa\n")
+        expected = self.findings("--commit", "HEAD")
+        self.assertEqual(expected, (0, {("src/b.py", 1, "suppression-added")}))
+        self.repo.write("clean.txt", "x = f()\n")
+        clean = self.repo.git("hash-object", "-w", "clean.txt")
+        self.repo.git("replace", self.repo.git("rev-parse", "HEAD:src/b.py"), clean)
+        self.assertEqual(self.findings("--commit", "HEAD"), expected)
+
+    def test_the_reason_is_counted_on_the_message_git_stores_whatever_encoding_it_is_asked_to_print(self):
+        reason = "é" * 12  # 12 characters, 20 are needed; as GBK bytes the same text is 24
+        self.repo.commit(f"Park a test\n\nCheck-change: {reason}", tests__test_thing_py=self.skipped)
+        self.assertEqual(self.findings("--commit", "HEAD"), self.SKIP_FOUND)
+        stored = subprocess.run(
+            ["git", "-C", str(self.repo.root), "log", "-1", "--format=%B"],
+            env=self.repo.env, capture_output=True, check=True,
+        ).stdout
+        for encoding in ("GBK", "ISO-8859-1", "UTF-16"):
+            with self.subTest(encoding):
+                self.repo.git("config", "i18n.logOutputEncoding", encoding)
+                printed = subprocess.run(
+                    ["git", "-C", str(self.repo.root), "log", "-1", "--format=%B"],
+                    env=self.repo.env, capture_output=True, check=True,
+                ).stdout
+                if printed == stored:
+                    # without this the test would pass whatever the scanner does
+                    self.skipTest(f"this git does not re-encode a log message as {encoding}")
+                self.assertEqual(self.findings("--commit", "HEAD"), self.SKIP_FOUND)
+
+    def test_renormalizing_merges_does_not_change_what_a_merge_is_compared_with(self):
+        self.repo.commit(norm_txt="a\nb\nc\n", src__m_py="m = 1\n")
+        base = self.repo.git("rev-parse", "HEAD")
+        self.repo.git("checkout", "-q", "-b", "side", base)
+        self.repo.commit("Side", norm_txt=b"a\r\nb\r\nc\r\n")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("Main", norm_txt="a\nB\nc\n")
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", "side", check=False)
+        self.repo.commit("Merge side", norm_txt="a\nB\nc\n", src__m_py="m = 1  # noqa\n")
+        expected = self.repo.scan("--commit", "HEAD", "--json")
+        self.assertEqual(expected[0], 0, expected)
+        self.repo.git("config", "merge.renormalize", "true")
+        self.repo.git("config", "core.autocrlf", "true")
+        self.assertEqual(self.repo.scan("--commit", "HEAD", "--json"), expected)
+
     def test_environment_variables_that_change_git_diff_are_not_passed_on(self):
         self.repo.git("rm", "-q", "-r", "tests/pkg")
         self.repo.commit(tests__pkg="now a file\n", tests__test_thing_py=self.skipped)
@@ -3094,10 +3348,13 @@ class UnreadableChanges(RepoCase):
         for change in ({"severity": "note"}, {"allow": ["x"]}, {"exempt_paths": ["*"]}):
             with self.subTest(change=change):
                 overlay.write_text(json.dumps({"rules": {"unreadable-change": change}}))
+                # the overlay is rejected, so nothing it says takes effect: the finding stands
                 code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(overlay))
-                self.assertEqual(code, 2, out)
+                self.assertEqual(code, 1, out)
+                self.assertIn("tautology-added", out)
                 self.assertIn("unreadable-change", err)
                 self.assertIn("cannot", err)
+                self.assertIn("every rule is judged as block", err)
 
 
 MACHINERY = {
@@ -3244,9 +3501,11 @@ class MachineryChanged(RepoCase):
         explicit.write_text(json.dumps({"rules": {MACHINERY_RULE: {"allow": ["x"]}}}))
         self.put("Hook", **{hook: MACHINERY[hook] + "exit 0\n"})
         code, out, err = self.repo.scan("--commit", "HEAD", "--overlay", str(explicit))
-        self.assertEqual(code, 2, out)
+        self.assertEqual(code, 1, out)  # rejected, so the hook change is judged as a block
+        self.assertIn(MACHINERY_RULE, out)
         self.assertIn(MACHINERY_RULE, err)
         self.assertIn("no line to allow", err)
+        self.assertIn("every rule is judged as block", err)
         document = json.loads(RULES.read_text())
         document["rules"].append({"id": "gone", "kind": "deleted", "classes": ["test"], "why": "w"})
         custom = Path(self._tmp.name) / "custom-rules.json"

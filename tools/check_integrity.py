@@ -16,7 +16,9 @@ merge base for ``A...B``), the remote side for ``--pre-push`` (for a new branch 
 with the remote's default branch, else the first parent of its oldest new commit). An overlay
 in the baseline that is not valid is applied as nothing, every rule is judged as ``block``, and
 a warning goes to standard error: the commit that repairs the file must be able to pass. An
-overlay given with ``--overlay`` is read as it is, and an error in it ends the run.
+overlay given with ``--overlay`` is read as it is; one that is there but not valid is treated the
+same way (CI hands it the baseline's file, so a broken one must not stop every run), while a path
+that does not exist is a usage error.
 
 A merge commit is judged by what the merge changed beyond the automatic merge (``git show
 --remerge-diff``, git 2.36 or newer). ``--staged`` judges a merge that waits to be committed
@@ -41,7 +43,7 @@ file deleted; the new side is not judged.
 
 Exit status: 0 no blocking finding, or every one justified; 1 an unjustified blocking
 finding; 2 a usage error, a revision that does not exist, a missing or too old git, a git call
-that fails, a broken rules file or a broken overlay file given with ``--overlay``. The guard
+that fails, a broken rules file or a path given with ``--overlay`` that does not exist. The guard
 fails closed. Standard
 library only; one file, so it can be copied into another repository together with its rules
 file.
@@ -56,6 +58,7 @@ import functools
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections import Counter
@@ -389,10 +392,21 @@ def apply_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
 
 
 def load_overlay(path: Path, rules: RuleSet) -> RuleSet:
-    """The overlay file named with ``--overlay``, read from disk as it is."""
+    """The overlay file named with ``--overlay``, read from disk as it is. A path that is not
+    there, or cannot be read, is an IntegrityError (a usage error); a file that is there but
+    cannot be used (not a regular file, not UTF-8, not a valid overlay) is an OverlayError, as
+    for the overlay of a baseline."""
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:
+        raise IntegrityError(f"cannot read {path}: {exc}") from exc
+    if not stat.S_ISREG(mode):
+        raise OverlayError(f"{path} is not a regular file")
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:
+    except UnicodeDecodeError as exc:
+        raise OverlayError(f"{path} is not valid UTF-8 ({exc.reason})") from exc
+    except OSError as exc:
         raise IntegrityError(f"cannot read {path}: {exc}") from exc
     return parse_overlay(text, str(path), rules)
 
@@ -480,7 +494,10 @@ def parse_patch(
             index += 1
             if raw.startswith(b"\\"):
                 continue  # "\ No newline at end of file"
-            tag, text = raw[:1], decode(raw[1:])
+            # An empty line inside a hunk is a blank unchanged line whose leading space was
+            # dropped (``diff.suppressBlankEmpty``); the scanner pins that off, but a patch
+            # written with it still reads the same.
+            tag, text = (b" ", "") if raw == b"" else (raw[:1], decode(raw[1:]))
             if tag in (b"+", b"-") and not in_run:
                 hunk += 1
                 in_run = True
@@ -510,12 +527,22 @@ def parse_patch(
 # --- git -----------------------------------------------------------------------------
 
 
-# Configuration that changes the text of a diff, the files it lists or the automatic merge a
-# merge commit is compared with. Each entry is passed as ``git -c``, which beats the
-# repository's, the user's and the system's configuration and ``GIT_CONFIG_*`` alike. Entries
-# that a command line flag of DIFF_FLAGS already pins (colour, renames) are not repeated.
+# Configuration that changes the text of a diff, the files it lists and in what order, the
+# objects it reads, the text of a commit message or the automatic merge a merge commit is
+# compared with. Each entry is passed as ``git -c``, which beats the repository's, the user's
+# and the system's configuration and ``GIT_CONFIG_*`` alike. Entries that a command line flag
+# of DIFF_FLAGS (or the ``-U`` of read_change) already pins (colour, renames, context lines,
+# external diff, text conversion, submodules) are not repeated. ``diff.suppressBlankEmpty`` is
+# pinned and also read (parse_patch), so a patch written with it is understood either way;
+# ``core.useReplaceRefs`` keeps a local ``git replace`` from showing the scanner other objects
+# than the ones that are pushed.
 GIT_CONFIG = (
     "core.quotePath=false",
+    "core.useReplaceRefs=false",
+    "i18n.logOutputEncoding=UTF-8",
+    "diff.suppressBlankEmpty=false",
+    f"diff.orderFile={os.devnull}",
+    "merge.renormalize=false",
     "merge.conflictStyle=merge",
     "merge.renames=true",
     "merge.directoryRenames=conflict",
@@ -870,18 +897,39 @@ def short(rev: str) -> str:
     return rev[:SHORT] if OBJECT_ID.fullmatch(rev) else rev
 
 
+def distrust(rules: RuleSet, error: OverlayError) -> RuleSet:
+    """The rules for an overlay that cannot be used: none of it is applied, every rule blocks,
+    and one warning goes to standard error."""
+    print(
+        f"{PROG}: warning: {' '.join(str(error).split())}; no overlay is applied and every rule is judged as {BLOCK}",
+        file=sys.stderr,
+    )
+    return RuleSet(
+        rules.classes,
+        tuple(replace(rule, severity=BLOCK) for rule in rules.rules),
+        rules.version_lines,
+        BLOCK,
+    )
+
+
 class Judges:
     """The rules a change is judged by. ``--overlay`` and ``--no-overlay`` fix them for the
     whole run. Otherwise they are the rules with the overlay of the change's baseline
     applied, read once per baseline. A baseline with no overlay, or none at all (a root
     commit, a repository without commits), leaves the rules as they are. An overlay in the
-    baseline that is not valid applies nothing and makes every rule block, with one warning
-    on standard error: a commit that repairs the file would otherwise be judged by it."""
+    baseline, or one given with ``--overlay``, that is not valid applies nothing and makes
+    every rule block, with one warning on standard error: a commit that repairs the file would
+    otherwise be judged by it. An ``--overlay`` path that does not exist is a usage error."""
 
     def __init__(self, rules: RuleSet, overlay: Path | None, no_overlay: bool) -> None:
         self.rules = rules
-        self.fixed = rules if no_overlay else None if overlay is None else load_overlay(overlay, rules)
         self.cache: dict[str | None, RuleSet] = {}
+        self.fixed: RuleSet | None = rules if no_overlay else None
+        if overlay is not None and not no_overlay:
+            try:
+                self.fixed = load_overlay(overlay, rules)
+            except OverlayError as exc:
+                self.fixed = distrust(rules, exc)
 
     def at(self, baseline: str | None) -> RuleSet:
         if self.fixed is not None:
@@ -897,16 +945,7 @@ class Judges:
             text = baseline_overlay(baseline)
             return self.rules if text is None else parse_overlay(text, f"{OVERLAY_NAME} at {short(baseline)}", self.rules)
         except OverlayError as exc:
-            print(
-                f"{PROG}: warning: {' '.join(str(exc).split())}; no overlay is applied and every rule is judged as {BLOCK}",
-                file=sys.stderr,
-            )
-            return RuleSet(
-                self.rules.classes,
-                tuple(replace(rule, severity=BLOCK) for rule in self.rules.rules),
-                self.rules.version_lines,
-                BLOCK,
-            )
+            return distrust(self.rules, exc)
 
 
 # --- judging -------------------------------------------------------------------------
@@ -1289,7 +1328,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help=f"apply this file instead of the {OVERLAY_NAME} of the baseline (HEAD, the first "
-        "parent, the left end of the range, the remote side of the push); an error in it exits 2",
+        "parent, the left end of the range, the remote side of the push); a path that does not "
+        "exist exits 2, a file that is not valid is judged as a broken baseline overlay is",
     )
     overlay.add_argument("--no-overlay", action="store_true", help=f"ignore {OVERLAY_NAME}")
     parser.add_argument("--json", action="store_true", help="print a JSON report on stdout")

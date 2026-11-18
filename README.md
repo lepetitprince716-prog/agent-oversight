@@ -143,13 +143,14 @@ python3 tools/check_integrity.py --pre-push < refs                             #
 
 Exit code 0 means no blocking finding or every one justified, 1 means an unjustified blocking
 finding, 2 means the tool could not do its job (a usage error, a missing revision, a missing or
-too old git, a failed git call, an unreadable rules file or a broken file given with `--overlay`):
+too old git, a failed git call, an unreadable rules file or a path given with `--overlay` that does not exist):
 it never passes by default. `--json` prints the same report for a program, with a level on each
 finding.
 
 The diff the scanner reads does not depend on the clone it runs in. Every git call pins the
 settings that change diff text, the file list or the automatic merge of a merge (prefixes,
-algorithm, hunk context, renames, conflict style and the like) and drops the environment
+algorithm, hunk context, renames, conflict style, file order, the blank-line spelling, replace refs,
+message encoding, renormalizing and the like) and drops the environment
 variables that do the same, and the patches are read as text, so a `-diff` attribute or a diff
 driver cannot hide lines. A change the scanner cannot read is not an error and not a pass: it is
 a blocking finding of the rule `unreadable-change`, and a `Check-change:` line waives it like any
@@ -247,8 +248,9 @@ for `--commit`, the left end of `--range` (the merge base for `A...B`) and the r
 commit; a root commit or a range without a common ancestor has no baseline and no overlay. A
 baseline overlay that is not valid (not UTF-8, not a regular file, a bad key) is applied as
 nothing: one line goes to standard error and every rule is judged as `block`, so the commit that
-repairs the file is not held back by the broken one. `--overlay PATH` reads that file instead and
-an error in it exits 2; `--no-overlay` reads none.
+repairs the file is not held back by the broken one. `--overlay PATH` reads that file instead (the
+CI step hands it the baseline's) and one that is there but not valid is treated the same way, so a
+broken file cannot stop every run; a path that does not exist exits 2. `--no-overlay` reads none.
 
 This repository's own file exempts `tests/test_check_integrity.py` from `skip-added`,
 `suppression-added` and `bypass-added`: that file holds marker strings as data. Editing those
