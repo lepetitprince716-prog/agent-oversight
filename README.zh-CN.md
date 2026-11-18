@@ -82,13 +82,31 @@ python3 tools/check_integrity.py --range origin/main..HEAD                     #
 python3 tools/check_integrity.py --pre-push < refs                             # git 给 pre-push 钩子的那几行
 ```
 
-退出码 0 表示没有需要理由的发现，或都有理由；1 表示有没理由的 `block` 发现；2 表示工具没能完成检查（规则表读
-不了、git 调用失败、diff 解析不了），不会默认放行。`--json` 给程序看，每条发现带级别。
+退出码 0 表示没有需要理由的发现，或都有理由；1 表示有没理由的 `block` 发现；2 表示工具没能完成检查（用法错误、
+指定的提交不存在、git 缺失或太旧、git 调用失败、规则表读不了，或 `--overlay` 给的文件有错），不会默认放行。`--json` 给程序看，
+每条发现带级别。
+
+扫描器读到的 diff 不受所在克隆的影响。每次 git 调用都固定会改变 diff 文本、文件列表或合并自动结果的配置（前缀、算法、
+上下文、重命名、冲突标记样式等），并去掉起同样作用的环境变量；补丁按文本读，所以 `-diff` 属性或 diff 驱动藏不住行。
+读不懂的改动不是错误也不是放行，而是规则 `unreadable-change` 的一条 `block` 发现，和别的发现一样，一行 `Check-change:`
+就能放行。包括：解析不了的补丁、子模块改动、未合并的路径、章鱼合并。文件类型变了（普通文件变符号链接，或反过来）按旧文件
+被删算。扫描器自己的规则 `unreadable-change` 和 `overlay-changed` 不能在规则表里定义，也不能被叠加文件改。
+
+运行检查的文件（钩子、CI 工作流、`tools/check_integrity.py` 和它的规则表；规则表里的类 `machinery`）按整个文件判，规则
+`check-machinery-changed`，每个文件一条发现：加行或删行、文件新建、删除或移动、权限位变了、文件类型变了，不管行写什么，
+都是 `block`，和读这些文件各行的规则并列报。`check-file-weakened` 里对新增行的放宽判断，除了 `pyproject.toml`，现在也
+覆盖 lint 和类型检查配置（类 `lint-config`：ruff、mypy、flake8、pylint、pyright、pytest.ini、setup.cfg、tox.ini、
+coverage、eslint、biome、clippy、deny、golangci、shellcheck、stylelint、markdownlint）。
 
 合并提交按这次合并在自动合并之外又改了什么来判（`git show --remerge-diff`）：干净的合并没有发现，被合并进来的提交
 各自只判一次。解决冲突时加了跳过、删了检查行，会报在合并提交上；解决冲突时去掉的冲突标记不算。这要 git 2.36 或更新：
-git 太旧，或者是章鱼合并（三个及以上父提交，git 不能对它做 remerge-diff），退出码为 2 并说明，不会换个办法硬判。
-`--staged` 在收尾一次合并的提交上，仍然和第一个父提交比。
+git 太旧，退出码为 2 并说明，不会换个办法硬判。章鱼合并（三个及以上父提交，git 不能对它做 remerge-diff）是一条
+`unreadable-change` 发现。
+
+`--staged` 在合并等着提交时（存在 `MERGE_HEAD`，不论是冲突之后还是 `git merge --no-commit`）也这样判：拿暂存区的结果和
+自动合并（`git merge-tree --write-tree`，要 git 2.38 或更新，否则退出码为 2）比，不再和 `HEAD` 比，所以干净的合并不会让
+commit-msg 钩子去要被合并进来的那些提交的理由，只判解决冲突时改的部分。解决冲突时去掉的冲突标记不算发现。正在进行的合并
+有两个以上被合并的提交时，是一条 `unreadable-change` 发现。
 
 ### 单个仓库调整规则
 
@@ -108,8 +126,15 @@ git 太旧，或者是章鱼合并（三个及以上父提交，git 不能对它
 ```
 
 这个文件本身受管：对它的任何改动（加行、删行、新建、删除）都是扫描器自己的 `overlay-changed` 规则的一条 `block`
-发现，要 `Check-change:` 行，所以一次提交不能不说理由就放宽判它的规则。叠加文件不能改动、降级或豁免这条规则（退出码
-2）。`--overlay PATH` 读另一个文件，`--no-overlay` 不读。
+发现，要 `Check-change:` 行，所以一次提交不能不说理由就放宽判它的规则。叠加文件不能提到 `overlay-changed` 和
+`unreadable-change`；对整个文件才判的规则（如 `check-machinery-changed`）不能加 `allow`：它没有可放行的行。
+
+判一次改动的叠加文件，取自这次改动的基线提交，从来不是工作区里的，也不是被判提交自己带的：没暂存的修改放宽不了判它的
+规则。基线是：`--staged` 用 `HEAD`（合并进行中也一样），`--commit` 用第一个父提交，`--range` 用左端（`A...B` 用合并
+基点），`--pre-push` 用远端那一侧。远端上新建的分支，用它和 `refs/remotes/<remote>/HEAD` 的合并基点上的叠加文件，找不到
+就用最早的新提交的第一个父提交；根提交或没有共同祖先的范围没有基线，也没有叠加文件。基线里的叠加文件无效（不是 UTF-8、
+不是普通文件、有不认识的键）时，当作没有叠加：stderr 一行警告，所有规则都按 `block` 判，这样修好它的那次提交不会被坏文件
+拦住。`--overlay PATH` 改读那个文件，里面有错就退出码 2；`--no-overlay` 不读。
 
 本仓库自己的文件让 `tests/test_check_integrity.py` 不受 `skip-added`、`suppression-added`、`bypass-added` 判断：
 这个文件里有当作数据的标记字符串。改这些字符串不要理由行；在这个文件里删测试或删断言照样要，在别的测试文件里加跳过也照样要。
@@ -126,10 +151,13 @@ cd "$(git rev-parse --show-toplevel)"
 python3 tools/check_integrity.py --staged --message-file "$1"
 ```
 
-pre-push 钩子把 git 给的标准输入接到 `--pre-push`；新分支扫的是没有任何远端分支持有的提交。
-[.github/workflows/ci.yml](.github/workflows/ci.yml) 对每个拉取请求、以及每次推送到默认分支以外的分支，跑同样的扫描，
-拉取请求上扫描器、规则表和 `.check-integrity.json` 取自 base 分支。推送到默认分支时不扫：合并拉取请求产生的提交
-不带原来各个提交的 `Check-change:` 行，而拉取请求已经逐个提交判过。本地的 pre-push 钩子仍然会扫直接推送。
+pre-push 钩子把 git 给的标准输入接到 `--pre-push`，并传远端的名字（`--remote "$1"`），新分支靠它找基线；新分支扫的是
+没有任何远端分支持有的提交。[.github/workflows/ci.yml](.github/workflows/ci.yml) 对每个拉取请求和每次推送跑同样的扫描。
+扫描器、规则表和 `.check-integrity.json` 一律取自基线，不取自被判的提交：拉取请求取 base 分支，推送到别的分支取默认分支，
+推送到默认分支取旧的分支头（基线里还没有扫描器时，用改动自己带的那份判）。拉取请求扫它新增的提交；新分支或强推扫从它和
+默认分支的合并基点起的每个提交，没有合并基点时只扫最上面一个。推送到默认分支也扫它带来的提交，但那里的发现只是警告，步骤
+照样通过（推送已经落地，而压缩合并留下的提交不带原来各个提交的 `Check-change:` 行）；扫描器自己出错（退出码 2）仍然让
+步骤失败。第一次推送或强推到默认分支没有可扫的，会说明。
 
 ## 模板
 

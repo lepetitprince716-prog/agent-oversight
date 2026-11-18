@@ -662,6 +662,160 @@ class MergeCommits(RepoCase):
         self.assertEqual(code, 0, "a commit with one parent needs no remerge-diff")
 
 
+class StagedMerge(RepoCase):
+    """While a merge waits to be committed (MERGE_HEAD exists), --staged judges what the
+    resolution changed beyond the automatic merge, as --commit does for the merge commit."""
+
+    CI = ".github__workflows__ci_yml"
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.repo.commit(
+            "Seed", README_md="seed\n", src__a_py="a = 1\n", tests__test_s_py=BASE_TEST, tests__test_t_py=BASE_TEST
+        )
+
+    def start_merge(self, *branches):
+        """Check out main and merge the branches without committing; a conflict stays open."""
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", *branches, check=False)
+
+    def side(self, name="side", message=None, **files):
+        self.repo.git("checkout", "-q", "-b", name, self.base)
+        self.repo.commit(message or f"Work on {name}", **files)
+        self.repo.git("checkout", "-q", "main")
+
+    def conflicting_workflow(self):
+        self.repo.commit("Add the workflow", **{self.CI: "steps:\n  - run: make test\n"})
+        self.base = self.repo.git("rev-parse", "HEAD")
+        self.side(**{self.CI: "steps:\n  - run: make test-a\n"})
+        self.repo.commit("Main", **{self.CI: "steps:\n  - run: make test-b\n"})
+
+    def staged(self, *extra, cwd=None):
+        code, out, err = self.repo.scan("--staged", "--json", *extra, cwd=cwd)
+        self.assertIn(code, (0, 1, 2), out + err)
+        if code == 2:
+            return code, err
+        return code, {(f["path"], f["rule"], f["justified"]) for f in json.loads(out)["findings"]}
+
+    def test_a_clean_merge_is_not_judged_by_what_the_merged_side_brought(self):
+        self.side(message=f"Park a test\n\n{REASON}", tests__test_s_py=skipped(BASE_TEST))
+        self.repo.commit(f"Park another\n\n{REASON}", tests__test_t_py=skipped(BASE_TEST))
+        self.start_merge("side")
+        self.assertTrue((self.repo.root / ".git" / "MERGE_HEAD").exists())
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (staged, 0 files)"), err)
+
+    def test_a_skip_added_while_resolving_a_conflict_is_a_finding_and_a_reason_line_clears_it(self):
+        line = "        self.assertEqual(1, 1)\n"
+        self.side(tests__test_s_py=BASE_TEST.replace(line, line.rstrip() + "  # side\n"))
+        self.repo.commit("Main", tests__test_s_py=BASE_TEST.replace(line, line.rstrip() + "  # main\n"))
+        self.start_merge("side")
+        self.repo.write(
+            "tests/test_s.py",
+            skipped(BASE_TEST).replace(line, line.rstrip() + "  # side\n" + line.rstrip() + "  # main\n"),
+        )
+        self.repo.git("add", "-A")
+        self.assertEqual(self.staged(), (1, {("tests/test_s.py", "skip-added", False)}))
+        message = Path(self._tmp.name) / "message.txt"
+        message.write_text(f"Merge side\n\n{REASON}\n", encoding="utf-8")
+        self.assertEqual(self.staged("--message-file", str(message)), (0, {("tests/test_s.py", "skip-added", True)}))
+
+    def test_conflict_markers_that_the_resolution_removes_are_not_findings(self):
+        self.conflicting_workflow()
+        self.start_merge("side")
+        self.repo.write(".github/workflows/ci.yml", "steps:\n  - run: make test-b\n  - run: make test-a\n")
+        self.repo.git("add", "-A")
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (staged, 1 files)"), err)
+
+    def test_dropping_a_line_of_a_check_file_while_resolving_is_still_reported(self):
+        self.conflicting_workflow()
+        self.start_merge("side")
+        self.repo.write(".github/workflows/ci.yml", "steps:\n  - run: make test-a\n")
+        self.repo.git("add", "-A")
+        found = self.staged()
+        self.assertEqual(found[0], 1)
+        self.assertEqual({rule for _, rule, _ in found[1]}, {"check-file-weakened", "check-machinery-changed"})
+
+    def test_the_verdict_does_not_depend_on_the_conflict_style_of_the_user(self):
+        for style in ("merge", "diff3", "zdiff3"):
+            with self.subTest(style=style):
+                self.setUp()
+                self.repo.git("config", "merge.conflictStyle", style)
+                self.conflicting_workflow()
+                self.start_merge("side")
+                self.repo.write(".github/workflows/ci.yml", "steps:\n  - run: make test-b\n  - run: make test-a\n")
+                self.repo.git("add", "-A")
+                code, out, err = self.repo.scan("--staged")
+                self.assertEqual((code, out.strip()), (0, "check-integrity: ok (staged, 1 files)"), err)
+
+    def test_a_merge_without_a_common_ancestor_is_judged_too(self):
+        self.repo.git("checkout", "-q", "--orphan", "other")
+        self.repo.git("rm", "-rfq", ".")
+        self.repo.commit("Unrelated", other_txt="other\n")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", "--allow-unrelated-histories", "other")
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual((code, out.strip()), (0, "check-integrity: ok (staged, 0 files)"), err)
+
+    def test_an_octopus_merge_in_progress_is_an_unreadable_change(self):
+        self.side("one", src__one_py="x = 1\n")
+        self.side("two", src__two_py="x = 1\n")
+        self.start_merge("one", "two")
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("(octopus merge):0 unreadable-change", out)
+        message = Path(self._tmp.name) / "message.txt"
+        message.write_text(f"Octopus\n\n{REASON}\n", encoding="utf-8")
+        code, out, err = self.repo.scan("--staged", "--message-file", str(message))
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("1 justified finding(s)", out)
+
+    def test_it_works_from_a_subfolder_and_from_a_linked_worktree(self):
+        self.side(message=f"Park a test\n\n{REASON}", tests__test_s_py=skipped(BASE_TEST))
+        self.repo.commit("Touch readme", README_md="seed 2\n")
+        self.start_merge("side")
+        self.assertEqual(self.staged(cwd=self.repo.root / "tests"), (0, set()))
+        self.repo.git("merge", "--abort")
+        linked = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-linked"
+        self.repo.git("worktree", "add", "-q", "-b", "wt", str(linked), "main")
+        self.addCleanup(lambda: shutil.rmtree(linked, ignore_errors=True))
+        self.repo.git("-C", str(linked), "merge", "-q", "--no-ff", "--no-commit", "side")
+        self.assertEqual(self.staged(cwd=linked), (0, set()))
+
+    def test_a_staged_change_without_a_merge_in_progress_is_judged_against_head_as_before(self):
+        self.side(message=f"Park a test\n\n{REASON}", tests__test_s_py=skipped(BASE_TEST))
+        self.repo.write("tests/test_t.py", skipped(BASE_TEST))
+        self.repo.git("add", "-A")
+        self.assertEqual(self.staged(), (1, {("tests/test_t.py", "skip-added", False)}))
+
+    def test_a_git_without_merge_tree_write_tree_exits_2_and_names_the_version(self):
+        self.side(src__b_py="b = 1\n")
+        self.start_merge("side")
+        shim = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-oldgit"
+        shim.mkdir()
+        self.addCleanup(lambda: shutil.rmtree(shim, ignore_errors=True))
+        (shim / "git").write_text(
+            '#!/bin/sh\nfor arg in "$@"; do\n'
+            '  if [ "$arg" = "--version" ]; then echo "git version 2.37.0"; exit 0; fi\n'
+            f'done\nexec {shlex.quote(shutil.which("git"))} "$@"\n'
+        )
+        (shim / "git").chmod(0o755)
+        self.repo.env["PATH"] = f"{shim}{os.pathsep}{self.repo.env['PATH']}"
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual(code, 2, out)
+        self.assertIn("merge-tree", err)
+        self.assertIn("2.38", err)
+
+    def test_an_unreadable_merge_head_exits_2_instead_of_passing(self):
+        self.side(src__b_py="b = 1\n")
+        self.start_merge("side")
+        (self.repo.root / ".git" / "MERGE_HEAD").write_text("not a commit id\n")
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual(code, 2, out)
+        self.assertIn("MERGE_HEAD", err)
+
+
 class RangeAndErrors(RepoCase):
     def test_range_pairs_each_commit_with_its_message(self):
         base = self.repo.commit(tests__test_a_py=BASE_TEST)

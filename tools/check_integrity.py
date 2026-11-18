@@ -19,7 +19,10 @@ a warning goes to standard error: the commit that repairs the file must be able 
 overlay given with ``--overlay`` is read as it is, and an error in it ends the run.
 
 A merge commit is judged by what the merge changed beyond the automatic merge (``git show
---remerge-diff``, git 2.36 or newer).
+--remerge-diff``, git 2.36 or newer). ``--staged`` judges a merge that waits to be committed
+(``MERGE_HEAD`` exists) the same way: the index against the automatic merge of HEAD and the
+merged commit (``git merge-tree --write-tree``, git 2.38 or newer). Conflict markers that the
+resolution removes are not findings. More than one merged commit is an ``unreadable-change``.
 The files that run the checks (hooks, CI workflows, this scanner and its rules file; class
 ``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
 deleted or moved file, other permission bits or another file type is a blocking finding
@@ -89,6 +92,7 @@ OVERLAY_GUARD = "overlay-changed"
 UNREADABLE = "unreadable-change"
 BUILTIN_RULES = (OVERLAY_GUARD, UNREADABLE)
 REMERGE_DIFF_GIT = (2, 36)
+MERGE_TREE_GIT = (2, 38)  # git merge-tree --write-tree
 GITLINK = b"160000"  # the mode of a submodule entry
 OCTOPUS_PATH = "(octopus merge)"  # stands in for the path of a change that has none
 # The conflict markers a merge resolution removes; they are not content the author dropped.
@@ -600,27 +604,37 @@ def read_change(command: list[str], base: list[str], change: Change, merge: bool
     return diff
 
 
-def collect(base: list[str], merge: bool = False) -> list[FileDiff]:
+def collect(base: list[str], merge: bool = False, markers: bool = False) -> list[FileDiff]:
     """Read every changed file of one diff, one git call per file. ``merge`` is for the one
-    id of a merge commit: its diff is what the merge changed beyond the automatic merge, with
-    the conflict markers that the resolution removed left out."""
+    id of a merge commit: its diff is what the merge changed beyond the automatic merge.
+    ``markers`` is for a diff against an automatic merge that had conflicts: the conflict
+    markers that the resolution removed are left out of the removed lines, as they are
+    not content the author dropped (a merge commit always has them left out)."""
     command = ["show", "--format=", "--remerge-diff"] if merge else ["diff"]
     changes = changed_files(command, base)
     names = sorted({name for change in changes for name in (change.path, change.old_path) if name})
-    return [read_change(command, base, change, merge, names) for change in changes]
+    return [read_change(command, base, change, merge or markers, names) for change in changes]
 
 
-@functools.lru_cache(maxsize=1)
-def require_remerge_diff() -> None:
-    """A merge commit is judged with ``git show --remerge-diff``; an older git, or one whose
-    version cannot be read, ends the run instead of judging the merge some other way."""
-    need = ".".join(map(str, REMERGE_DIFF_GIT))
+@functools.lru_cache(maxsize=None)
+def require_git(need: tuple[int, int], what: str) -> None:
+    """``what`` needs git ``need`` or newer; an older git, or one whose version cannot be
+    read, ends the run instead of judging the change some other way."""
     found = re.search(r"(\d+)\.(\d+)", git(["--version"]).decode("utf-8", "replace"))
-    if found is None or (int(found.group(1)), int(found.group(2))) < REMERGE_DIFF_GIT:
+    if found is None or (int(found.group(1)), int(found.group(2))) < need:
         raise IntegrityError(
-            f"a merge commit needs git {need} or newer for --remerge-diff (this git: "
+            f"{what} needs git {'.'.join(map(str, need))} or newer (this git: "
             f"{found.group(0) if found else 'version unreadable'})"
         )
+
+
+def require_remerge_diff() -> None:
+    require_git(REMERGE_DIFF_GIT, "a merge commit judged with --remerge-diff")
+
+
+def octopus(count: int, why: str) -> list[FileDiff]:
+    """The one finding of a merge of more than two parents: git has no automatic merge of it."""
+    return [FileDiff(OCTOPUS_PATH, unreadable=f"an octopus merge ({count} parents): {why}")]
 
 
 def empty_tree() -> str:
@@ -646,12 +660,45 @@ def collect_commit(oid: str) -> list[FileDiff]:
     commit, and for a merge commit against the automatic merge of its parents."""
     parents = parents_of(oid)
     if len(parents) > 2:
-        reason = f"an octopus merge ({len(parents)} parents): git has no --remerge-diff for it"
-        return [FileDiff(OCTOPUS_PATH, unreadable=reason)]
+        return octopus(len(parents), "git has no --remerge-diff for it")
     if len(parents) == 2:
         require_remerge_diff()
         return collect([oid], merge=True)
     return collect([parents[0] if parents else empty_tree(), oid])
+
+
+def merge_heads() -> list[str]:
+    """The commits of a merge that waits to be committed (``MERGE_HEAD``), empty when none does.
+    git names the file, so a linked worktree and a subfolder of the repository work alike."""
+    path = Path(git(["rev-parse", "--git-path", "MERGE_HEAD"]).decode("utf-8", "replace").strip())
+    try:
+        text = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError) as exc:
+        raise IntegrityError(f"cannot read MERGE_HEAD: {exc}") from exc
+    heads = text.split()
+    if not heads or not all(OBJECT_ID.fullmatch(head) for head in heads):
+        raise IntegrityError("MERGE_HEAD does not hold commit ids; cannot tell what the merge brings in")
+    return heads
+
+
+def collect_staged() -> list[FileDiff]:
+    """The staged changes: against HEAD, and while a merge waits to be committed against the
+    automatic merge of HEAD and the merged commit, so only what the resolution changed is judged."""
+    heads = merge_heads()
+    if not heads:
+        return collect(["--cached"])
+    if len(heads) > 1:
+        return octopus(len(heads) + 1, "git has no automatic merge of it to compare the result with")
+    require_git(MERGE_TREE_GIT, "judging a merge in progress with git merge-tree --write-tree")
+    done = run_git(["merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", "HEAD", heads[0]])
+    # exit 0: merged cleanly; exit 1: conflicts, the tree holds them as markers; either way line 1 is the tree
+    first = done.stdout.split(b"\n", 1)[0].decode("ascii", "replace").strip()
+    if done.returncode not in (0, 1) or not OBJECT_ID.fullmatch(first):
+        detail = done.stderr.decode("utf-8", "replace").strip()
+        raise IntegrityError(f"git merge-tree failed (exit {done.returncode}): {detail}")
+    return collect(["--cached", first], markers=True)
 
 
 def commit_message(oid: str) -> str:
@@ -1054,7 +1101,7 @@ class Report(NamedTuple):
 
 def run(args: argparse.Namespace, judges: Judges) -> Report:
     if args.staged:
-        diffs = collect(["--cached"])
+        diffs = collect_staged()
         message = read_message_file(args.message_file)
         return Report(judge("staged", diffs, message, judges.at(head_commit())), 0, len(diffs), True)
     if args.pre_push:
@@ -1090,7 +1137,12 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--staged", action="store_true", help="scan the staged diff")
+    mode.add_argument(
+        "--staged",
+        action="store_true",
+        help="scan the staged diff; while a merge waits to be committed, what the resolution changed "
+        "beyond the automatic merge",
+    )
     mode.add_argument(
         "--commit",
         metavar="REV",

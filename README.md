@@ -142,17 +142,45 @@ python3 tools/check_integrity.py --pre-push < refs                             #
 ```
 
 Exit code 0 means no blocking finding or every one justified, 1 means an unjustified blocking
-finding, 2 means the tool could not do its job (an unreadable rules file, a failed git call, a
-diff it cannot parse): it never passes by default. `--json` prints the same report for a
-program, with a level on each finding.
+finding, 2 means the tool could not do its job (a usage error, a missing revision, a missing or
+too old git, a failed git call, an unreadable rules file or a broken file given with `--overlay`):
+it never passes by default. `--json` prints the same report for a program, with a level on each
+finding.
+
+The diff the scanner reads does not depend on the clone it runs in. Every git call pins the
+settings that change diff text, the file list or the automatic merge of a merge (prefixes,
+algorithm, hunk context, renames, conflict style and the like) and drops the environment
+variables that do the same, and the patches are read as text, so a `-diff` attribute or a diff
+driver cannot hide lines. A change the scanner cannot read is not an error and not a pass: it is
+a blocking finding of the rule `unreadable-change`, and a `Check-change:` line waives it like any
+other. That covers a patch that does not parse, a submodule change, an unmerged path and an
+octopus merge. A file that changes type (a regular file becomes a symbolic link, or the reverse)
+counts as the old file deleted. The scanner's own rules `unreadable-change` and `overlay-changed`
+cannot be defined in a rules file or changed by an overlay.
+
+The files that run the checks (hooks, CI workflows, `tools/check_integrity.py` and its rules
+file; the class `machinery` of the rules file) are judged as a whole by the rule
+`check-machinery-changed`, one finding per file: any line added or removed, a file created,
+deleted or moved, other permission bits or another file type is blocking, whatever the lines say,
+next to the line rules that also read those files. The loosening rule of `check-file-weakened`
+for added lines covers lint and type-check configuration (the class `lint-config`: ruff, mypy,
+flake8, pylint, pyright, pytest.ini, setup.cfg, tox.ini, coverage, eslint, biome, clippy, deny,
+golangci, shellcheck, stylelint, markdownlint) as it does `pyproject.toml`.
 
 A merge commit is judged by what the merge changed beyond the automatic merge
 (`git show --remerge-diff`), so a clean merge has no findings and the commits it brought in are
 judged on their own, once. A resolution that adds a skip or drops a check line is reported on the
-merge; the conflict markers a resolution removes are not. This needs git 2.36 or newer: with an
-older git, or for an octopus merge (three or more parents, which git cannot remerge-diff), the run
-exits 2 and says so, instead of judging the merge some other way. `--staged` on a commit that
-concludes a merge still compares with the first parent.
+merge; the conflict markers a resolution removes are not. This needs git 2.36 or newer; with an
+older git the run exits 2 and says so, instead of judging the merge some other way. An octopus
+merge (three or more parents, which git cannot remerge-diff) is one `unreadable-change` finding.
+
+`--staged` judges a merge the same way while it waits to be committed (a `MERGE_HEAD` exists,
+whether after a conflict or `git merge --no-commit`): it compares the staged result with the
+automatic merge (`git merge-tree --write-tree`, git 2.38 or newer, else exit 2) instead of with
+`HEAD`, so a clean merge does not make the commit-msg hook ask for the reasons of the commits it
+brings in, and only what the resolution changed is judged. Conflict markers that the resolution
+removes are not findings. A merge in progress with more than two parents is one
+`unreadable-change` finding.
 
 ### Adjusting the rules for one repository
 
@@ -176,8 +204,21 @@ at all. A renamed file is exempt only when its old and its new path both match.
 The file is itself guarded: any change to it (a line added or removed, the file created or
 deleted) is a blocking finding of the scanner's own rule `overlay-changed` and needs a
 `Check-change:` line, so a commit cannot loosen the rules it is judged by without saying why.
-The overlay cannot change, lower or exempt that rule (exit 2). `--overlay PATH` reads another
-file, and `--no-overlay` reads none.
+An overlay cannot name `overlay-changed` or `unreadable-change`, and `allow` is refused on a
+rule id whose entries all judge whole files, such as `check-machinery-changed`: there is no line
+to allow.
+
+The overlay that judges a change is the one in that change's baseline commit, never the
+working tree's and never the judged commit's own: an edit that was never staged cannot loosen the
+judge. The baseline is `HEAD` for `--staged` (also while a merge is in progress), the first parent
+for `--commit`, the left end of `--range` (the merge base for `A...B`) and the remote side for
+`--pre-push`. A branch that is new on its remote is judged by the overlay at its merge base with
+`refs/remotes/<remote>/HEAD`, and when that is not known by the first parent of its oldest new
+commit; a root commit or a range without a common ancestor has no baseline and no overlay. A
+baseline overlay that is not valid (not UTF-8, not a regular file, a bad key) is applied as
+nothing: one line goes to standard error and every rule is judged as `block`, so the commit that
+repairs the file is not held back by the broken one. `--overlay PATH` reads that file instead and
+an error in it exits 2; `--no-overlay` reads none.
 
 This repository's own file exempts `tests/test_check_integrity.py` from `skip-added`,
 `suppression-added` and `bypass-added`: that file holds marker strings as data. Editing those
@@ -197,13 +238,20 @@ cd "$(git rev-parse --show-toplevel)"
 python3 tools/check_integrity.py --staged --message-file "$1"
 ```
 
-For a pre-push hook, pipe git's standard input into `--pre-push`; a new branch is scanned for
-the commits that no remote-tracking branch has. [.github/workflows/ci.yml](.github/workflows/ci.yml)
-runs the same scan on every pull request and on every push to a branch other than the default
-branch, taking the scanner, its rules and `.check-integrity.json` from the base branch on a pull
-request. A push to the default branch is not scanned: merging a pull request leaves commits that
-carry none of the `Check-change:` lines of the commits it was made of, and the pull request was
-already judged commit by commit. The local pre-push hook still scans a direct push.
+For a pre-push hook, pipe git's standard input into `--pre-push` and pass the remote's name
+(`--remote "$1"`), which a new branch needs to find its baseline; a new branch is scanned for the
+commits that no remote-tracking branch has.
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs the same scan on every pull request and
+on every push. The scanner, its rules and `.check-integrity.json` always come from a baseline, not
+from the commits being judged: the base branch for a pull request, the default branch for a push
+to another branch, the old tip for a push to the default branch (a baseline without a scanner is
+judged by the copy in the change itself). A pull request scans the commits it adds; a new branch
+or a force push scans every commit from its merge base with the default branch, and only the top
+commit when there is none. A push to the default branch scans the commits it brings, but a
+finding there is a warning and the step passes (the push has landed, and a squash merge leaves
+commits that carry none of the `Check-change:` lines of the commits it was made of); an error of
+the scanner (exit 2) still fails the step. The first push or a force push to the default branch
+has nothing to scan and says so.
 
 ## The templates
 
