@@ -300,16 +300,25 @@ For a pre-push hook, pipe git's standard input into `--pre-push` and pass the re
 (`--remote "$1"`), which a new branch needs to find its baseline; a new branch is scanned for the
 commits that no remote-tracking branch has.
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the same scan on every pull request and
-on every push. The workflow has two jobs: `gates` holds the privacy scan and this scan and no
-other step, so it runs no code from the change being judged, and `tests` runs the repository's own
-tests. On a pull request `gates` checks out the head commit and scans it and its history, not the
-merge commit GitHub makes for the run (that commit carries the web identity of the account that
-opened the pull request, which the privacy scan would refuse). The scanners start in isolated mode (`python3 -I -B`). A newer run replaces an older one
-only on a pull request: a push is scanned from its old tip to its new one, so a cancelled push
-run would leave the commits it brought unscanned. The scanner, its rules and `.check-integrity.json` always come from a baseline, not
-from the commits being judged: the base branch for a pull request, the default branch for a push
-to another branch, the old tip for a push to the default branch (a baseline without a scanner is
-judged by the copy in the change itself). A pull request scans the commits it adds; a new branch
+on every push. The workflow has two jobs: `gates` holds this scan and then the privacy scan, with
+no step that runs the repository's tests or build, and `tests` runs the repository's own tests.
+On a pull request `gates` checks out the head commit, not the merge commit GitHub makes for the
+run (that commit carries the web identity of the account that opened the pull request, which the
+privacy scan would refuse); the privacy scan reads every branch the checkout fetched
+(`rev-list --all`), not only the history of that commit. The scanners start in isolated mode
+(`python3 -I -B`). A pull request run is replaced by a newer run of the same pull request; a push
+run never is, because every push run has a concurrency group of its own: a push is scanned from its
+old tip to its new one, so a replaced or cancelled push run would leave the commits it brought
+unscanned (GitHub also replaces a run that is still waiting in a group by the one queued after it,
+whatever `cancel-in-progress` says, so pushes to one branch cannot share a group). This scan comes
+first because, on a push, the privacy scan runs the `tools/privacy_scan.py` of the pushed commit,
+which could move `origin/<default branch>` and leave this scan with nothing to judge; the privacy
+step still runs when this one failed. This scan takes its scanner, its rules and
+`.check-integrity.json` from a baseline, not from the commits being judged: the base branch for a
+pull request, the default branch for a push to another branch, the old tip for a push to the
+default branch (a baseline without a scanner is judged by the copy in the change itself). The
+privacy scan does the same on a pull request only; on a push it runs the pushed commit's own
+scanner. A pull request scans the commits it adds; a new branch
 or a force push scans every commit from its merge base with the default branch, and only the top
 commit when there is none. A push to the default branch scans the commits it brings, but a
 finding there is a warning and the step passes (the push has landed, and a squash merge leaves
@@ -322,19 +331,29 @@ has nothing to scan and says so.
 - The local hooks, and the scanner they call, come from the working tree. Anyone or any agent
   with write access can switch them off locally. The CI step is the stronger check, and it has
   limits of its own:
-  - The `gates` job runs no code from the change being judged: the repository's tests run in the
-    separate `tests` job, and the scanners start in isolated mode, so a file the change drops next
-    to them cannot stand in for a standard library module. The step judges with the scanner, the
-    rules and the overlay of the baseline.
-  - When a pull request changes the workflow file itself, GitHub runs the pull request's own
-    version of it, and that change can rewrite this step. Such a change has to be read by a
-    person; the scan of the push to the default branch after the merge reports it as a warning.
+  - On a pull request the `gates` job runs no code from the change being judged: both scanners are
+    the base branch's, the repository's tests run in the separate `tests` job, and the scanners
+    start in isolated mode, so a file the change drops next to them cannot stand in for a standard
+    library module. This step judges with the scanner, the rules and the overlay of the baseline.
+    On a push the privacy scan runs the pushed commit's own `tools/privacy_scan.py`, after this
+    step has judged the push; changing that file is a finding of this step
+    (`check-machinery-changed`), but what the pushed scanner prints is its own word.
+  - When a change touches the workflow file itself, GitHub runs the changed version: on the pull
+    request, and again on the push to the default branch after the merge. A change that rewrites or
+    removes this step is therefore reported by no step in CI, and nothing there says the step was
+    switched off. In a clone with the hooks on, pre-push reports it as `check-machinery-changed`
+    unless the commit carries a reason line (tried on a throwaway repository). A person has to read
+    every change under `.github/workflows/` before it merges.
   - When the rules file or the scanner on the default branch is itself broken (it cannot be
     loaded), this step fails for every pull request, the one that repairs it included, and the
     repair can only merge with a red check. Keeping a broken rules file from being merged in the
     first place is one of the things the `tests` job is for.
 - A push to the default branch is scanned, but a finding there is only a warning: the step does
   not fail.
+- The commit-msg hook can accept a reason line that git then removes. With `core.commentChar` set
+  to a letter, a reason line that begins with that letter passes the hook, which reads the message
+  before git drops its comment lines, and the commit lands without the line (tried); pre-push and
+  CI refuse it later.
 - When a pull request is merged with GitHub's merge button, GitHub documents that the commit that
   lands on the default branch is written with the web identity of the account that merges. If that
   account has not turned on "Keep my email addresses private", the address is not on the allowed
@@ -371,18 +390,38 @@ has nothing to scan and says so.
     class.
   - The four flags above are reported on any added line of a hook, CI file, script or lint
     configuration, whatever that line runs, and on no line of a file outside those classes, such
-    as a Python source file that builds a `pytest --collect-only` command.
+    as a Python source file that builds a `pytest --collect-only` command. They are a list, not
+    every flag of the kind: pytest's `--setup-plan` and `--setup-only` also make no test run and
+    are not on it, and `--passWithNoTests` is known in that spelling only (`--pass-with-no-tests`
+    is not).
+  - The collected names are the union of several runners' patterns, not the rule of this
+    repository's runner. `test_x.py` renamed to `x_test.py` counts as collected before and after,
+    while `unittest discover` with its default pattern `test*.py` no longer collects the new name
+    (a failing test, then `Ran 0 tests` and OK); a name like `testx.py` was never a collected
+    name to the scanner.
+  - A test moved into a file the same commit creates, under a name no runner collects, is not
+    reported, because a file the change adds is not judged. A rename out of collection or a
+    deletion of a test file is let through when the same commit deletes a file named like its source
+    (`util.py` for `test_util.py`), in any directory, whether or not that is the file it tests.
 - Changes that lose nothing but need a reason line:
   - Two sides of a merge that edited the same assertion in a test file: whichever side the
     resolution drops, `--ours`, `--theirs` or a hand edit, the dropped assertion is reported by
     `assertion-loss` on the merge commit. A merge made with `-X ours` or `-X theirs` is reported
     the same way.
-  - A coverage floor that goes up, and a floor line where only a trailing comment or the
-    indentation changed: `guard_lines` reports any rewrite of the line.
+  - A coverage floor that goes up, and a floor line where only a trailing comment, the
+    indentation or one more flag at the end of the line changed: `guard_lines` reports any rewrite
+    of the line.
 - False positives seen on real history, which a reason line clears:
   - `skip-added` reports each added `skipTest(...)` or `skipUnless(...)` line, also a skip that
     only guards the environment (running as root, a sandbox without semaphores) and a line whose
     only change is the wording of its message, because the rewritten line is not the same text.
+  - `test-removed` reports a rename of a file whose name is collected but that holds no test
+    (`tests/test_helpers.py` with only helper functions, renamed to `tests/helpers.py`), because
+    it reads the name and not what is in the file.
+  - A constant-false condition and the other marker lines are recognized line by line, so they
+    are reported when they appear as data too: sample code in a triple-quoted string in a test
+    file, a sample project file under `tests/`. The overlay file can exempt such a file whole
+    (`exempt_paths`; this repository does it for its own test file).
   - The rules that read whole hook and CI files report a restructured workflow (jobs renamed,
     a step moved to another job, a changed matrix) once per removed line; in the cases read, no
     check was switched off.

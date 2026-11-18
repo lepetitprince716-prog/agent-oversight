@@ -32,13 +32,16 @@ was not enough.
    whose local clone has no executable pre-push hook.
 
 3. CI. `.github/workflows/ci.yml` has two jobs: `gates` runs the same scan over the tree and
-   the whole history on every push and pull request, and `tests` runs the tests. On a pull
-   request `gates` checks out and scans the head commit and its history, not the merge commit
+   every branch the checkout fetched (`rev-list --all`, not only the head commit's history) on
+   every push and pull request, after the commit check of the change, and `tests` runs the
+   tests. On a pull request `gates` checks out the head commit, not the merge commit
    GitHub makes for the run: that commit is written with the web identity of the account that
    opened the pull request, whose address is not on the allowed list. The scanner and its rules
-   are taken from the base branch on a pull request, so a change cannot loosen the rules it is judged by. It
-   can still edit the workflow file, and GitHub runs the pull request's own copy of that:
-   read every change under `.github/` before it merges. CI runs after the content has
+   are taken from the base branch on a pull request, so a change cannot loosen the rules it is
+   judged by; on a push the scan runs the scanner of the pushed commit, and the commit check,
+   which runs first, reports a change to it. A change can still edit the workflow file, and
+   GitHub runs the changed copy of that, on the pull request and again after the merge: nothing
+   in CI reports it, so read every change under `.github/` before it merges. CI runs after the content has
    reached GitHub: it catches what slipped past the hooks and what other people send, and it
    cannot undo a push.
 
