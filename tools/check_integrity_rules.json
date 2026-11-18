@@ -1,12 +1,18 @@
 {
   "version": 1,
-  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'added-after' fires on an added line matching a pattern whose line above it in the new file (the nearest one that is neither blank nor a whole-line comment) matches a regex of the rule's after list, and does not fire when the patch does not show that line (it shows three unchanged lines around each change), nor does it cancel a line against a removed one; 'net-added' is like 'added', but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class; 'changed' fires once on a file of the class (before or after a move) that the change adds, deletes, moves, retypes, gives other permission bits or alters by any line, whatever the line says, and takes no patterns. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' and 'changed' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change. severity: 'block' (the default) needs a Check-change line in the commit message; 'note' is printed and counted but never fails the run. An id may appear in several entries; they share one severity. A repository adjusts severity, appends allow-regexes (they have no effect on a rule without patterns) and exempts paths per rule id in its own .check-integrity.json. Class machinery is what check-machinery-changed guards: the hook and CI paths of class bypass, the scanner's own two files and the privacy scanner's two files, which the hooks and CI call as a second check; a repository changes the rule's scope by changing this class. Class lint-config is the lint and test configuration, which the added-line loosening rule of class mixed also covers. version_lines: regexes (full match, one line without its line end) for the lines of a hook or CI file whose version numbers a bot may move: a pinned or tagged uses:, runs-on, the version key of a runtime or toolchain (python-version, node-version, go-version and the like), image, container and the rev of a pre-commit hook. When every changed line of a file of class bypass that was only modified in place pairs a removed with an added line, in one hunk and in order, that is the same version line once its version numbers (digits and dots, led by v or not) and its full hex digests (40 or 64 digits) are replaced by placeholders, the file reports the note version-bumped (a rule of the scanner itself: the overlay may only set its severity) instead of check-file-weakened and check-machinery-changed. With other changed lines too, check-machinery-changed stays and the paired lines are not reported one by one. Any other change on those lines, a version line outside the list and any other number stays as it was. Without the list nothing is a version bump.",
+  "note": "Rules for check_integrity.py. classes: name -> path regexes (re.search on the repository-relative POSIX path); a file may belong to several classes. rules: kind 'added' fires on an added line matching a pattern; 'added-after' fires on an added line matching a pattern whose line above it in the new file (the nearest one that is neither blank nor a whole-line comment) matches a regex of the rule's after list, and does not fire when the patch does not show that line (it shows three unchanged lines around each change), nor does it cancel a line against a removed one; 'net-added' is like 'added', but a marker the same file also loses on a removed line (same pattern, same marker text) cancels one added copy, so a changed or moved line is not new; 'removed' fires on a removed line, except that in a hunk replacing as many lines as it adds (skip_lines aside) a line is reported only when the line in its place drops one of its words or adds a conjunction to an if: condition; 'net-loss' fires when all files of the class in the change together lose more matching lines than they gain, at each file with a loss of its own; 'deleted' fires when a file of the class is deleted or renamed out of the class; 'changed' fires once on a file of the class (before or after a move) that the change adds, deletes, moves, retypes, gives other permission bits or alters by any line, whatever the line says, and takes no patterns. Renames are detected; a renamed file is judged by its changes. A deleted file is judged by 'deleted' and 'changed' rules only. allow: regexes tried at the start of each pattern match; a match where one of them matches is ignored. skip_lines: lines matching one of these are not looked at. existing_only: true skips files added by the change. spare_with_source: true (kind 'deleted' only) skips a deleted test file whose source file, by name (test_x.py or x_test.py and x.py, x_test.go and x.go, x.test.ts or x.spec.ts and x.ts or another JS/TS suffix), is deleted in the same change; such a rule also reports, once, a test file renamed within its class from a name the test runners collect (test_*.py, *_test.py, x.test.* and x.spec.* of JavaScript and TypeScript, *_test.go) to a name they do not, and the source of the old name spares it likewise. severity: 'block' (the default) needs a Check-change line in the commit message; 'note' is printed and counted but never fails the run. An id may appear in several entries; they share one severity. A repository adjusts severity, appends allow-regexes (they have no effect on a rule without patterns) and exempts paths per rule id in its own .check-integrity.json. Class machinery is what check-machinery-changed guards: the hook and CI paths of class bypass, the scanner's own two files and the privacy scanner's two files, which the hooks and CI call as a second check; a repository changes the rule's scope by changing this class. Class lint-config is the lint and test configuration, which the added-line loosening rule of class mixed also covers. version_lines: regexes (full match, one line without its line end) for the lines of a hook or CI file whose version numbers a bot may move: a pinned or tagged uses:, runs-on, the version key of a runtime or toolchain (python-version, node-version, go-version and the like), image, container and the rev of a pre-commit hook. When every changed line of a file of class bypass that was only modified in place pairs a removed with an added line, in one hunk and in order, that is the same version line once its version numbers (digits and dots, led by v or not) and its full hex digests (40 or 64 digits) are replaced by placeholders, the file reports the note version-bumped (a rule of the scanner itself: the overlay may only set its severity) instead of check-file-weakened and check-machinery-changed. With other changed lines too, check-machinery-changed stays and the paired lines are not reported one by one. Any other change on those lines, a version line outside the list and any other number stays as it was. Without the list nothing is a version bump. guard_lines: regexes (searched in the line) for lines that set a floor, such as a coverage threshold: a line rewritten in place (in a hunk that replaces as many lines as it adds) is reported by a 'removed' rule when its old line matches both the rule and one of these and the new line is not the very same text, even when every word of the old line is still there (90 to .90); raising the floor is reported too, and needs its reason line.",
   "version_lines": [
     "^\\s*(-\\s*)?uses:\\s*[\\w.-]+/[\\w.-]+(/[^\\s@]+)?@\\S+(\\s+#.*)?$",
     "^\\s*(-\\s*)?runs-on:\\s*\\S.*$",
     "^\\s*(-\\s*)?(python|node|go|java|ruby|bun|deno|dotnet|php|pnpm|uv|rust|gradle|elixir|otp|terraform)-version:\\s*\\S.*$",
     "^\\s*(-\\s*)?(image|container):\\s*\\S.*$",
     "^\\s*(-\\s*)?rev:\\s*\\S.*$"
+  ],
+  "guard_lines": [
+    "\\bfail_under\\b",
+    "\\bfail-under\\b",
+    "--cov-fail-under\\b",
+    "\\bcoverageThreshold\\b"
   ],
   "classes": {
     "test": [
@@ -140,6 +146,20 @@
       "existing_only": true
     },
     {
+      "id": "skip-added",
+      "kind": "net-added",
+      "classes": [
+        "test"
+      ],
+      "why": "a test file gained a condition that is always false, so what it guards never runs",
+      "patterns": [
+        "^\\s*if\\s+(False|0)\\s*:",
+        "^\\s*if\\s*\\(\\s*false\\s*\\)\\s*\\{",
+        "^\\s*if\\s+false\\s*\\{"
+      ],
+      "existing_only": true
+    },
+    {
       "id": "suppression-added",
       "kind": "net-added",
       "classes": [
@@ -177,7 +197,7 @@
       "classes": [
         "bypass"
       ],
-      "why": "a hook or CI step is told to ignore failure or skip checks",
+      "why": "a hook or CI step is told to ignore failure, skip checks, or run tests without running them",
       "patterns": [
         "--no-verify\\b",
         "\\bgit\\s+(commit|push|merge|am)\\b[^\\n]*\\s-n\\b",
@@ -190,7 +210,8 @@
         "\\ballow_failure:\\s*true\\b",
         "\\bHUSKY=0\\b",
         "\\bSKIP=\\S",
-        "\\bcore\\.hooksPath\\b"
+        "\\bcore\\.hooksPath\\b",
+        "(?<![\\w-])--(co|collect-only|passWithNoTests|exit-zero)(?![\\w-])"
       ]
     },
     {
@@ -199,9 +220,10 @@
       "classes": [
         "script"
       ],
-      "why": "a script swallows the failure of a check command on the same line",
+      "why": "a script swallows the failure of a check command on the same line, or runs tests without running them",
       "patterns": [
-        "^(?=.*(?<![\\w-])(pytest|unittest|ruff|mypy|pyright|eslint|tsc|biome|clippy|cargo\\s+test|(npm|pnpm|yarn)\\s+(run\\s+)?test|bun\\s+test|go\\s+(test|vet))(?![\\w-])).*\\|\\|\\s*(true\\b|:(?![\\w:])|exit\\s+0\\b)"
+        "^(?=.*(?<![\\w-])(pytest|unittest|ruff|mypy|pyright|eslint|tsc|biome|clippy|cargo\\s+test|(npm|pnpm|yarn)\\s+(run\\s+)?test|bun\\s+test|go\\s+(test|vet))(?![\\w-])).*\\|\\|\\s*(true\\b|:(?![\\w:])|exit\\s+0\\b)",
+        "(?<![\\w-])--(co|collect-only|passWithNoTests|exit-zero)(?![\\w-])"
       ]
     },
     {
@@ -343,8 +365,9 @@
         "\\bdisallow_\\w+",
         "\\bwarn_(unused|return|redundant)\\w*",
         "\\bcheck_untyped_defs\\b",
-        "\\bfail_under\\b",
+        "\\bfail[_-]under\\b",
         "--cov-fail-under\\b",
+        "\\bcoverageThreshold\\b",
         "--strict\\w*",
         "\\b(extend-)?select\\s*=",
         "=\\s*[\"']?(deny|forbid|warn)[\"']?\\s*$",
@@ -383,7 +406,8 @@
         "\\b(noqa|nosec)\\b",
         "(^|\\s)-diff\\b",
         "\\sbinary\\b",
-        "\\blinguist-generated\\b"
+        "\\blinguist-generated\\b",
+        "(?<![\\w-])--(co|collect-only|passWithNoTests|exit-zero)(?![\\w-])"
       ],
       "skip_lines": [
         "^\\s*(#|//|;)"

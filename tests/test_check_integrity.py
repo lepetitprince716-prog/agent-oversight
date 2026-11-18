@@ -4135,5 +4135,278 @@ class VersionBumps(RepoCase):
                 self.assertFalse(any(p.fullmatch(line) for p in patterns), line)
 
 
+class CheapSwitchOffs(RepoCase):
+    """Four cheap ways to switch tests or a coverage floor off with one rename, one line or one
+    rewritten line: a test file renamed out of the names the runners collect, an if with a
+    constant false condition, a flag that makes a runner collect without running, a floor
+    rewritten with every word kept."""
+
+    def findings(self):
+        _, report = self.head_json()
+        return [(f["path"], f["line"], f["rule"]) for f in report["findings"]]
+
+    def fresh_repo(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(Path(tmp.name))
+
+    def rename(self, old, new, content=BASE_TEST, **others):
+        self.repo.commit(**{old.replace("/", "__"): content}, **others)
+        self.repo.git("mv", old, new)
+        self.repo.commit("Rename")
+
+    # test-removed: a rename out of the collected names
+
+    COLLECTED = (
+        ("tests/test_x.py", "tests/x_cases.py"),
+        ("tests/x_test.py", "tests/x_cases.py"),
+        ("tests/x.test.ts", "tests/x.cases.ts"),
+        ("tests/x.spec.jsx", "tests/x.cases.jsx"),
+        ("tests/x_test.go", "tests/x_cases.go"),
+        ("web/x.test.ts", "web/x.cases.ts"),
+    )
+
+    def test_a_test_file_renamed_to_a_name_no_runner_collects_is_red_once(self):
+        for old, new in self.COLLECTED:
+            with self.subTest(old=old):
+                self.fresh_repo()
+                self.rename(old, new)
+                self.assertEqual(self.findings(), [(new, 0, "test-removed")])
+
+    def test_a_rename_between_collected_names_is_green(self):
+        pairs = (
+            ("tests/test_a.py", "tests/test_b.py"),
+            ("tests/test_a.py", "tests/a_test.py"),
+            ("web/a.test.ts", "web/b.spec.tsx"),
+            ("pkg/a_test.go", "pkg/b_test.go"),
+        )
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.fresh_repo()
+                self.rename(old, new)
+                code, out, _ = self.repo.scan("--commit", "HEAD")
+                self.assertEqual(code, 0, out)
+
+    def test_a_file_that_was_never_a_collected_name_may_be_renamed_to_one_that_is_not(self):
+        self.rename("tests/helpers.py", "tests/support.py", content="def helper():\n    return 1\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_test_renamed_out_of_the_names_with_its_source_deleted_is_green(self):
+        self.repo.commit(src__x_py="def f():\n    return 1\n", tests__test_x_py=BASE_TEST)
+        self.repo.git("mv", "tests/test_x.py", "tests/x_cases.py")
+        self.repo.commit("Rename and delete the source", src__x_py=None)
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_test_renamed_out_of_the_names_while_an_unrelated_source_goes_is_red(self):
+        self.repo.commit(src__y_py="def g():\n    return 2\n", tests__test_x_py=BASE_TEST)
+        self.repo.git("mv", "tests/test_x.py", "tests/x_cases.py")
+        self.repo.commit("Rename and delete another source", src__y_py=None)
+        self.assertEqual(self.findings(), [("tests/x_cases.py", 0, "test-removed")])
+
+    def test_a_deleted_test_file_is_still_reported_once(self):
+        self.repo.commit(tests__test_x_py=BASE_TEST)
+        self.repo.commit(tests__test_x_py=None)
+        self.assertEqual(self.findings(), [("tests/test_x.py", 0, "test-removed")])
+
+    # skip-added: a constant false condition
+
+    FALSE_CONDITIONS = {
+        "tests/test_a.py": "if False:\n",
+        "tests/test_b.py": "    if 0:\n",
+        "web/c.test.ts": "if (false) {\n",
+        "web/d.spec.js": "  if ( false ) {\n",
+        "pkg/e_test.go": "\tif false {\n",
+        "crate/tests/f.rs": "    if false {\n",
+    }
+
+    def test_an_added_constant_false_condition_in_a_test_file_is_red(self):
+        for path in self.FALSE_CONDITIONS:
+            self.repo.write(path, "// seed\n")
+        self.repo.commit()
+        for path, line in self.FALSE_CONDITIONS.items():
+            self.repo.write(path, "// seed\n" + line)
+        self.repo.commit()
+        found = set(self.findings())
+        for path in self.FALSE_CONDITIONS:
+            with self.subTest(path=path):
+                self.assertIn((path, 2, "skip-added"), found)
+
+    def test_other_conditions_files_and_comments_are_green(self):
+        greens = {
+            "tests/test_a.py": "if False_flag:\n    pass\nif 0 == x:\n    pass\nif 0.5:\n    pass\n# if False:\n",
+            "web/b.test.ts": "if (falsey) {\n}\nif (!false) {\n}\n// if (false) {\n",
+            "pkg/c_test.go": "\tif falsehood {\n\t}\n",
+            "src/d.py": "if False:\n    pass\n",
+        }
+        for path in greens:
+            self.repo.write(path, "seed\n")
+        self.repo.commit()
+        for path, text in greens.items():
+            self.repo.write(path, "seed\n" + text)
+        self.repo.commit()
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_new_test_file_is_not_an_existing_one(self):
+        self.repo.commit(README_md="seed\n")
+        self.repo.commit(tests__test_new_py="if False:\n    pass\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_constant_false_condition_that_was_there_and_only_moved_is_green(self):
+        seed = "import unittest\n\nif False:\n    x = 1\n\ny = 2\n"
+        self.repo.commit(tests__test_a_py=seed)
+        self.repo.commit(tests__test_a_py="import unittest\n\ny = 2\n\nif False:\n    x = 1\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.repo.commit(tests__test_a_py="import unittest\n\ny = 2\n\nif True:\n    if False:\n        x = 1\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_second_copy_of_a_constant_false_condition_is_red(self):
+        self.repo.commit(tests__test_a_py="if False:\n    x = 1\n")
+        self.repo.commit(tests__test_a_py="if False:\n    x = 1\nif False:\n    z = 1\n")
+        self.assertEqual(self.findings(), [("tests/test_a.py", 3, "skip-added")])
+
+    # a flag that makes a runner collect without running
+
+    FLAGS = ("--co", "--collect-only", "--passWithNoTests", "--exit-zero")
+
+    def test_a_flag_that_stops_the_tests_running_is_red_in_each_kind_of_file(self):
+        shapes = {
+            "pytest.ini": ("[pytest]\ntestpaths = tests\n", "addopts = {flag}\n", "check-file-weakened"),
+            "pyproject.toml": ('[project]\nname = "d"\n', 'addopts = "{flag}"\n', "check-file-weakened"),
+            ".github/workflows/ci.yml": ("on: push\n", "      - run: pytest {flag}\n", "bypass-added"),
+            ".githooks/pre-push": ("#!/bin/sh\n", "pytest {flag}\n", "bypass-added"),
+            "Makefile": ("all:\n", "\tpytest {flag}\n", "bypass-added"),
+            "package.json": ('{"name": "d"}\n', '{{"scripts": {{"test": "jest {flag}"}}}}\n', "bypass-added"),
+            "scripts/check.sh": ("#!/bin/sh\n", "flake8 {flag} .\n", "bypass-added"),
+        }
+        for path, (seed, _, _) in shapes.items():
+            self.repo.write(path, seed)
+        self.repo.commit()
+        for flag in self.FLAGS:
+            for path, (seed, line, _) in shapes.items():
+                self.repo.write(path, seed + line.format(flag=flag))
+            self.repo.commit(f"Add {flag}")
+            found = {(path, rule) for path, _, rule in self.findings()}
+            for path, (_, _, rule) in shapes.items():
+                with self.subTest(flag=flag, path=path):
+                    self.assertIn((path, rule), found)
+            for path, (seed, _, _) in shapes.items():
+                self.repo.write(path, seed)
+            self.repo.commit("Take it out")
+
+    def test_the_flag_is_found_where_a_line_is_rewritten_in_place(self):
+        self.repo.commit(pytest_ini="[pytest]\naddopts = --strict-markers\n")
+        self.repo.commit(pytest_ini="[pytest]\naddopts = --strict-markers --co\n")
+        self.assertEqual(self.findings(), [("pytest.ini", 2, "check-file-weakened")])
+
+    def test_flags_with_the_same_start_and_other_files_are_green(self):
+        self.repo.commit(pytest_ini="[pytest]\n", Makefile="all:\n", docs__usage_md="x\n")
+        self.repo.commit(
+            pytest_ini="[pytest]\naddopts = --cov=src --color=yes --collect-only-x --co-op\n",
+            Makefile="all:\n\tgit commit --amend --config x --cov-report=term --colour\n",
+            docs__usage_md="Run pytest --co or jest --passWithNoTests to list.\n",
+        )
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    # check-file-weakened: a floor rewritten with every word kept
+
+    FLOORS = {
+        ".coveragerc": ("[report]\nfail_under = 90\n", "[report]\nfail_under = .90\n"),
+        "setup.cfg": ("[coverage:report]\nfail_under = 90\n", "[coverage:report]\nfail_under = 90.0\n"),
+        "pyproject.toml": (
+            '[tool.interrogate]\nfail-under = 80\n',
+            '[tool.interrogate]\nfail-under = 80 # was 90\n',
+        ),
+        "tox.ini": ("[testenv]\ncommands = pytest --cov-fail-under=90\n", "[testenv]\ncommands = pytest --cov-fail-under=90.0\n"),
+        ".github/workflows/ci.yml": (
+            "      - run: pytest --cov-fail-under=90\n",
+            "      - run: pytest --cov-fail-under=90.0\n",
+        ),
+        "deno.json": ('{\n  "coverageThreshold": 90\n}\n', '{\n  "coverageThreshold": 90.0\n}\n'),
+    }
+
+    def test_a_floor_rewritten_in_place_is_red_even_when_every_word_stays(self):
+        for path, (seed, _) in self.FLOORS.items():
+            self.repo.write(path, seed)
+        self.repo.commit()
+        for path, (_, new) in self.FLOORS.items():
+            self.repo.write(path, new)
+        self.repo.commit()
+        found = {(path, rule) for path, _, rule in self.findings()}
+        for path in self.FLOORS:
+            with self.subTest(path=path):
+                self.assertIn((path, "check-file-weakened"), found)
+
+    def test_a_raised_floor_is_red_too_and_a_justified_one_passes(self):
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\n")
+        self.repo.commit(_coveragerc="[report]\nfail_under = 95\n")
+        self.assertEqual(self.findings(), [(".coveragerc", 2, "check-file-weakened")])
+        self.repo.commit(f"Raise the floor\n\n{REASON}\n", _coveragerc="[report]\nfail_under = 97\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_a_rewritten_line_that_is_not_a_floor_keeps_the_old_rule(self):
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\nomit = tests/*\n")
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\nomit = tests/* # ours\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_the_floor_of_the_other_lines_is_untouched_when_only_another_line_changes(self):
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\nomit = tests/*\n")
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\nomit = tests/*\nshow_missing = True\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+
+    def test_the_lines_that_count_are_the_tables_not_the_scanner_s(self):
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\n")
+        self.repo.commit(_coveragerc="[report]\nfail_under = .90\n")
+        document = json.loads(RULES.read_text())
+        self.assertEqual(self.findings(), [(".coveragerc", 2, "check-file-weakened")])
+        document["guard_lines"] = []
+        emptied = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-no-guard.json"
+        emptied.write_text(json.dumps(document))
+        self.addCleanup(lambda: emptied.unlink(missing_ok=True))
+        code, out, err = self.repo.scan("--commit", "HEAD", "--rules", str(emptied))
+        self.assertEqual(code, 0, out + err)
+
+    def test_the_lines_are_checked_when_the_table_is_loaded(self):
+        for value in ("fail_under", ["("], [""]):
+            with self.subTest(value=value):
+                document = json.loads(RULES.read_text())
+                document["guard_lines"] = value
+                path = Path(self._tmp.name).parent / f"{Path(self._tmp.name).name}-bad-guard.json"
+                path.write_text(json.dumps(document))
+                self.addCleanup(lambda p=path: p.unlink(missing_ok=True))
+                with self.assertRaisesRegex(ci.IntegrityError, "guard_lines"):
+                    ci.load_rules(path)
+
+    def test_the_floor_is_still_guarded_with_an_overlay_and_with_a_broken_one(self):
+        self.repo.commit(_coveragerc="[report]\nfail_under = 90\n")
+        self.repo.commit(
+            "Overlay", **{".check-integrity.json": json.dumps({"version": 1, "rules": {"skip-added": {"severity": "note"}}})}
+        )
+        self.repo.commit(_coveragerc="[report]\nfail_under = .90\n")
+        self.assertEqual(self.findings(), [(".coveragerc", 2, "check-file-weakened")])
+        self.repo.commit("Break the overlay", **{".check-integrity.json": "{"})
+        self.repo.commit(_coveragerc="[report]\nfail_under = .90 # tidy\n")
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("check-file-weakened", out)
+        self.assertIn("warning", err)
+
+    def test_weakens_reads_the_guard_it_is_given(self):
+        guard = ci.load_rules(RULES).guard_lines
+        self.assertTrue(ci.weakens("fail_under = 90", "fail_under = .90", guard))
+        self.assertFalse(ci.weakens("fail_under = 90", "fail_under = .90"))
+        self.assertFalse(ci.weakens("fail_under = 90", "fail_under = 90", guard))
+        self.assertFalse(ci.weakens("omit = a", "omit = a # b", guard))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,10 @@ tagged or pinned ``uses:``, ``runs-on``, the version key of a runtime or toolcha
 ``python-version``, ``image``, ``container``, a pre-commit ``rev``) of a hook or CI file is a note, ``version-bumped``, in place of those two rules
 (see ``bumped``); any other number, and any other change on those lines, stays as it was.
 
+A line rewritten in place is reported when it drops a word, and also when it is a floor line (``guard_lines``
+of the rules file: a coverage threshold) and the new text differs at all. A test file renamed from a name the
+test runners collect to one they do not is reported like a deletion (``test-removed``; see ``gone``).
+
 Every git call pins the configuration, attributes and environment that change diff text
 (``GIT_CONFIG``, ``GIT_ENV_DROP``, ``DIFF_FLAGS``), so the verdict does not depend on the clone
 it runs in. A change the scanner cannot read (a patch it cannot parse, a submodule, an octopus
@@ -86,7 +90,7 @@ RULE_KEYS = frozenset(
         "severity",
     }
 )
-DOCUMENT_KEYS = frozenset({"version", "note", "classes", "rules", "version_lines"})
+DOCUMENT_KEYS = frozenset({"version", "note", "classes", "rules", "version_lines", "guard_lines"})
 BLOCK, NOTE = "block", "note"
 SEVERITIES = frozenset({BLOCK, NOTE})
 OVERLAY_NAME = ".check-integrity.json"
@@ -204,6 +208,7 @@ class RuleSet:
     rules: tuple[Rule, ...]
     version_lines: tuple[re.Pattern[str], ...] = ()
     bump_severity: str = NOTE
+    guard_lines: tuple[re.Pattern[str], ...] = ()
 
     def severity_of(self, rule_id: str) -> str:
         """The severity of a rule id; load_rules makes every entry of one id agree."""
@@ -302,7 +307,8 @@ def load_rules(path: Path) -> RuleSet:
         if levels.setdefault(rule.id, rule.severity) != rule.severity:
             raise IntegrityError(f"{path}: entries of rule {rule.id} must share one severity")
     version_lines = compile_list(document.get("version_lines", []), f"{path}: version_lines")
-    return RuleSet(classes, rules, version_lines)
+    guard_lines = compile_list(document.get("guard_lines", []), f"{path}: guard_lines")
+    return RuleSet(classes, rules, version_lines, guard_lines=guard_lines)
 
 
 def parse_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
@@ -388,6 +394,7 @@ def apply_overlay(text: str, where: str, rules: RuleSet) -> RuleSet:
         ),
         rules.version_lines,
         bump_severity,
+        rules.guard_lines,
     )
 
 
@@ -909,6 +916,7 @@ def distrust(rules: RuleSet, error: OverlayError) -> RuleSet:
         tuple(replace(rule, severity=BLOCK) for rule in rules.rules),
         rules.version_lines,
         BLOCK,
+        rules.guard_lines,
     )
 
 
@@ -989,8 +997,9 @@ def tested_sources(path: str) -> frozenset[str]:
 
 
 def spared(diff: FileDiff, diffs: list[FileDiff]) -> bool:
-    """True if a deleted test file's source file was deleted in the same change."""
-    sources = tested_sources(diff.path)
+    """True if a deleted (or renamed away) test file's source file was deleted in the same
+    change. A renamed file is known by the name it had: that is the one that was collected."""
+    sources = tested_sources(diff.old_path if diff.status == "R" and diff.old_path is not None else diff.path)
     return any(
         other.deleted and other is not diff and other.path.rpartition("/")[2] in sources
         for other in diffs
@@ -998,25 +1007,36 @@ def spared(diff: FileDiff, diffs: list[FileDiff]) -> bool:
 
 
 def gone(diff: FileDiff, rule: Rule, rules: RuleSet) -> bool:
-    """True if a file of the rule's classes was deleted, or renamed out of those classes."""
+    """True if a file of the rule's classes was deleted, or renamed out of those classes. A
+    rule with ``spare_with_source`` judges test files by name, so for it a rename also counts
+    when the old name is one the test runners collect (see ``TEST_NAME``) and the new one is
+    not: the file stays in its directory and no runner runs it."""
     if diff.deleted:
         return bool(rules.classes_of(diff.path).intersection(rule.classes))
     if diff.status == "R" and diff.old_path is not None:
         before = rules.classes_of(diff.old_path).intersection(rule.classes)
-        return bool(before) and not rules.classes_of(diff.path).intersection(rule.classes)
+        if not before:
+            return False
+        if not rules.classes_of(diff.path).intersection(rule.classes):
+            return True
+        return rule.spare_with_source and bool(tested_sources(diff.old_path)) and not tested_sources(diff.path)
     return False
 
 
-def weakens(old: str, new: str) -> bool:
+def weakens(old: str, new: str, guard: tuple[re.Pattern[str], ...] = ()) -> bool:
     """For a line rewritten in place: True if the old line has a word the new one lacks, or
-    the new line adds a conjunction to a CI condition (``if:``), which narrows when it runs.
-    Only a reworded or widened line, with no word dropped, passes."""
+    the new line adds a conjunction to a CI condition (``if:``), which narrows when it runs,
+    or the old line is a guard line (``guard_lines`` of the rules file: a coverage floor) and
+    the new line is not the same text, whatever words it keeps: ``90`` becoming ``.90`` keeps
+    every word. Only a reworded or widened line, with no word dropped, passes."""
     if set(WORD.findall(old)) - set(WORD.findall(new)):
+        return True
+    if new != old and any(pattern.search(old) for pattern in guard):
         return True
     return bool(CONDITION.match(new)) and len(CONJUNCTION.findall(new)) > len(CONJUNCTION.findall(old))
 
 
-def removed_hits(diff: FileDiff, rule: Rule) -> list[Hit]:
+def removed_hits(diff: FileDiff, rule: Rule, rules: RuleSet) -> list[Hit]:
     """Removed lines the rule matches. Within a hunk that replaces as many lines as it adds
     (comment lines aside), each removed line is compared with the added line in its place
     and reported only if the rewrite weakens it."""
@@ -1031,7 +1051,7 @@ def removed_hits(diff: FileDiff, rule: Rule) -> list[Hit]:
         hits += [
             Hit(diff.path, old.number, rule.id, old.text)
             for old, new in pairs
-            if rule.matches(old.text) and weakens(old.text, new.text)
+            if rule.matches(old.text) and weakens(old.text, new.text, rules.guard_lines)
         ]
     return hits
 
@@ -1087,7 +1107,14 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
             continue
         if rule.kind == "deleted":
             if gone(diff, rule, rules) and not (rule.spare_with_source and spared(diff, diffs)):
-                hits.append(Hit(diff.path, 0, rule.id, "(file type changed)" if diff.typechange else "(file deleted)"))
+                what = (
+                    "(file type changed)"
+                    if diff.typechange
+                    else f"(file moved from {diff.old_path})"
+                    if diff.status == "R"
+                    else "(file deleted)"
+                )
+                hits.append(Hit(diff.path, 0, rule.id, what))
             continue
         if diff.deleted or rule.kind == "net-loss" or not classes.intersection(rule.classes):
             continue  # a deleted file is judged by its deletion alone
@@ -1104,7 +1131,7 @@ def judge_file(diff: FileDiff, diffs: list[FileDiff], rules: RuleSet) -> list[Hi
         elif rule.kind == "net-added":
             hits += net_added_hits(diff, rule)
         else:  # removed
-            hits += removed_hits(diff, rule)
+            hits += removed_hits(diff, rule, rules)
     return hits
 
 
