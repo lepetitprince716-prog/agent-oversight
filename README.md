@@ -120,8 +120,8 @@ repository turns on `local_only`, and `public = true` with it turns on `guard_of
 ## The commit check
 
 `tools/check_integrity.py` reads commits and flags the ones that weaken a check instead of
-passing it: a test skipped or deleted, assertions dropped, a linter or type checker silenced, a
-hook or CI step bypassed, a line removed from a check config. It is one file with a rules file
+passing it: a test skipped, deleted or renamed out of collection, assertions dropped, a linter or
+type checker silenced, a hook or CI step bypassed, a line removed from a check config. It is one file with a rules file
 next to it, standard library only.
 
 A flagged commit passes when its message has a top-level line
@@ -160,7 +160,8 @@ counts as the old file deleted. The scanner's own rules `unreadable-change` and 
 cannot be defined in a rules file or changed by an overlay.
 
 The files that run the checks (hooks, CI workflows, `tools/check_integrity.py` and its rules
-file; the class `machinery` of the rules file) are judged as a whole by the rule
+file, and the privacy scanner `tools/privacy_scan.py` with its rules `tools/privacy_rules.json`,
+which the hooks and CI call as a second check; the class `machinery` of the rules file) are judged as a whole by the rule
 `check-machinery-changed`, one finding per file: any line added or removed, a file created,
 deleted or moved, other permission bits or another file type is blocking, whatever the lines say,
 next to the line rules that also read those files. The loosening rule of `check-file-weakened`
@@ -197,6 +198,25 @@ Three rules catch a test that is switched off by editing it, not by deleting it:
   `assertTrue` or `assert` of a non-zero number or a non-empty string. A moved line is not new.
 
 A `Check-change:` line waives each of the three like any other finding.
+
+Four more cheap ways to switch a check off are covered, by rules that already existed and by one
+new list in the rules file:
+
+- `test-removed` also reports, once, a test file renamed from a name the test runners collect
+  (`test_*.py`, `*_test.py`, `x.test.*` and `x.spec.*` of JavaScript and TypeScript, `*_test.go`)
+  to a name they do not, such as `tests/x_cases.py`: the tests are still on disk and no longer
+  run. The source of the old name spares it, as for a deletion.
+- `skip-added` also reports a new condition that is always false in an existing test file
+  (`if False:`, `if 0:`, `if (false) {`, `if false {`): what it guards never runs. A moved line is
+  not new.
+- A flag that makes a runner collect without running (`--co`, `--collect-only`,
+  `--passWithNoTests`, `--exit-zero`) on an added line of a hook or CI file or of a script is
+  reported by `bypass-added`, and on an added line of a lint or test configuration by
+  `check-file-weakened`: the run is told to pass without running the tests.
+- `guard_lines` in the rules file lists the lines that set a floor (`fail_under`, `fail-under`,
+  `--cov-fail-under`, `coverageThreshold`). A floor line rewritten in place is reported by
+  `check-file-weakened` when the new text differs at all, even when every word is kept (`90`
+  to `.90`). Raising the floor is reported too and needs its reason line.
 
 A merge commit is judged by what the merge changed beyond the automatic merge
 (`git show --remerge-diff`), so a clean merge has no findings and the commits it brought in are
@@ -333,6 +353,37 @@ has nothing to scan and says so.
   are still collected (a false positive). `tautology-added` knows only the forms in its table:
   the same call written twice and compared is not one of them, because it cannot be told from a
   deterministic test, and other always-true assertions go unseen.
+- More ways to switch a test or a check off that the rules do not see:
+  - A `yield` added to a test function makes it a generator, so the runner no longer executes its
+    body. A reader that goes line by line cannot tell it from the `yield` of an ordinary fixture,
+    so it is not reported.
+  - A base class written as an expression (`unittest.TestCase.__base__`, which is `object`) is not
+    reported: the class line still holds the word `TestCase`, so no class counts as lost.
+  - A file the change adds is not judged. A new `conftest.py`, or a new `tests/__init__.py`, that
+    replaces the assertion methods when it is imported turns the whole suite green and is not
+    reported.
+  - A constant-false condition is recognized in four forms only: `if False:`, `if 0:`,
+    `if (false) {` and `if false {`. `else if (false)`, `if (0)` and `if (False):` are not.
+  - `coverageThreshold` in `package.json` and in `jest.config.*` is not watched. `package.json`
+    is in the class `script`, which has no rule for a rewritten line, and `jest.config.*` is in no
+    class.
+  - The four flags above are reported on any added line of a hook, CI file, script or lint
+    configuration, whatever that line runs, and on no line of a file outside those classes, such
+    as a Python source file that builds a `pytest --collect-only` command.
+- Changes that lose nothing but need a reason line:
+  - Two sides of a merge that edited the same assertion in a test file: whichever side the
+    resolution drops, `--ours`, `--theirs` or a hand edit, the dropped assertion is reported by
+    `assertion-loss` on the merge commit. A merge made with `-X ours` or `-X theirs` is reported
+    the same way.
+  - A coverage floor that goes up, and a floor line where only a trailing comment or the
+    indentation changed: `guard_lines` reports any rewrite of the line.
+- False positives seen on real history, which a reason line clears:
+  - `skip-added` reports each added `skipTest(...)` or `skipUnless(...)` line, also a skip that
+    only guards the environment (running as root, a sandbox without semaphores) and a line whose
+    only change is the wording of its message, because the rewritten line is not the same text.
+  - The rules that read whole hook and CI files report a restructured workflow (jobs renamed,
+    a step moved to another job, a changed matrix) once per removed line; in the cases read, no
+    check was switched off.
 
 ## The templates
 

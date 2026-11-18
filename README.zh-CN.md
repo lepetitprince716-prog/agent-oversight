@@ -65,7 +65,7 @@ PR 写成 `PR #12`、`owner/name#12` 或 PR 链接时会被查到。最后两项
 
 ## 提交检查
 
-`tools/check_integrity.py` 读提交，找出削弱检查而不是通过检查的改动：跳过或删除测试、去掉断言、压掉
+`tools/check_integrity.py` 读提交，找出削弱检查而不是通过检查的改动：跳过、删除或改名出收集范围的测试、去掉断言、压掉
 linter 或类型检查、绕过钩子或 CI 步骤、从检查配置里删行。它是一个文件加一份规则表，只用标准库。
 
 被报的提交，提交说明里有一行顶格的 `Check-change: <理由>`，理由不少于 20 个字符，就能通过；一行
@@ -92,7 +92,8 @@ python3 tools/check_integrity.py --pre-push < refs                             #
 就能放行。包括：解析不了的补丁、子模块改动、未合并的路径、章鱼合并。文件类型变了（普通文件变符号链接，或反过来）按旧文件
 被删算。扫描器自己的规则 `unreadable-change` 和 `overlay-changed` 不能在规则表里定义，也不能被叠加文件改。
 
-运行检查的文件（钩子、CI 工作流、`tools/check_integrity.py` 和它的规则表；规则表里的类 `machinery`）按整个文件判，规则
+运行检查的文件（钩子、CI 工作流、`tools/check_integrity.py` 和它的规则表，以及钩子和 CI 当作第二道检查调用的隐私扫描器
+`tools/privacy_scan.py` 和它的规则 `tools/privacy_rules.json`；规则表里的类 `machinery`）按整个文件判，规则
 `check-machinery-changed`，每个文件一条发现：加行或删行、文件新建、删除或移动、权限位变了、文件类型变了，不管行写什么，
 都是 `block`，和读这些文件各行的规则并列报。`check-file-weakened` 里对新增行的放宽判断，除了 `pyproject.toml`，现在也
 覆盖 lint 和类型检查配置（类 `lint-config`：ruff、mypy、flake8、pylint、pyright、pytest.ini、setup.cfg、tox.ini、
@@ -118,6 +119,18 @@ coverage、eslint、biome、clippy、deny、golangci、shellcheck、stylelint、
   只是挪了位置的行不算新增。
 
 这三条和别的发现一样，一行 `Check-change:` 就能放行。
+
+另外四种便宜的关检查办法，由已有的规则和规则表里新加的一个列表盖住：
+
+- `test-removed` 还会报一次：测试文件从测试运行器会收集的名字（`test_*.py`、`*_test.py`、JavaScript 和 TypeScript 的 `x.test.*`
+  和 `x.spec.*`、`*_test.go`）改成它们不收集的名字，例如 `tests/x_cases.py`：测试还在磁盘上，却不再运行。旧名字对应的源文件
+  同一提交里也被删时，和删除一样放行。
+- `skip-added` 还会报现有测试文件里新增的恒假条件（`if False:`、`if 0:`、`if (false) {`、`if false {`）：它守着的代码永远不会跑。
+  只是挪了位置的行不算新增。
+- 让运行器只收集不运行的参数（`--co`、`--collect-only`、`--passWithNoTests`、`--exit-zero`）出现在钩子、CI 文件或脚本的新增行里，
+  报 `bypass-added`；出现在 lint 或测试配置的新增行里，报 `check-file-weakened`：这一步被告知不跑测试也算通过。
+- 规则表里的 `guard_lines` 列出设下限的行（`fail_under`、`fail-under`、`--cov-fail-under`、`coverageThreshold`）。这样的行被原地改写，
+  新文本和旧文本只要有任何不同，`check-file-weakened` 就报，哪怕每个词都还在（`90` 改成 `.90`）。调高下限也报，也要理由行。
 
 合并提交按这次合并在自动合并之外又改了什么来判（`git show --remerge-diff`）：干净的合并没有发现，被合并进来的提交
 各自只判一次。解决冲突时加了跳过、删了检查行，会报在合并提交上；解决冲突时去掉的冲突标记不算。这要 git 2.36 或更新：
@@ -206,6 +219,24 @@ pre-push 钩子把 git 给的标准输入接到 `--pre-push`，并传远端的�
   返回、定义行和 `return` 之间隔着 docstring、定义行跨多行的，都看不出来。`test-class-detached` 只看一行里有没有 `TestCase`，
   基类换成间接的 `TestCase` 子类会被报出来，是误报。`tautology-added` 只认规则表里列的写法：「同一个调用写两遍再比较」不算，
   因为它和确定性测试分不开，别的恒真断言也看不出来。
+- 规则看不到的、关掉测试或检查的其他办法：
+  - 在测试函数里加一行 `yield`，函数变成生成器，运行器不再执行函数体。按行读的规则分不出它和普通 `yield` 夹具，所以不报。
+  - 基类写成表达式（`unittest.TestCase.__base__`，实际是 `object`）不报：类定义行里还有 `TestCase` 这个词，不算丢了一个类。
+  - 改动新增的文件不判。新的 `conftest.py` 或 `tests/__init__.py` 在导入时把断言方法换掉，整套测试会变绿，而不被报。
+  - 恒假条件只认四种写法：`if False:`、`if 0:`、`if (false) {`、`if false {`。`else if (false)`、`if (0)`、`if (False):` 不认。
+  - `package.json` 和 `jest.config.*` 里的 `coverageThreshold` 不在看守范围里：`package.json` 属于 `script` 类，那一类没有看改写的规则；
+    `jest.config.*` 不属于任何类。
+  - 上面四个参数，出现在钩子、CI 文件、脚本或 lint 配置的任何新增行里就报，不管那一行跑的是什么；不属于这些类的文件里的行不报，
+    例如拼出 `pytest --collect-only` 命令的 Python 源文件。
+- 没有丢东西、但要理由行的改动：
+  - 测试文件里，两边改了同一条断言，解决冲突时取一边：不论取哪一边（`--ours`、`--theirs` 或手改），被舍弃的那条都由 `assertion-loss`
+    报在合并提交上。`-X ours`、`-X theirs` 这类自动取一边的合并同理。
+  - 调高覆盖率下限；下限那一行只改了行尾注释或缩进也一样：`guard_lines` 报这一行的任何改写。
+- 真实历史里读到的误报，理由行可以放行：
+  - `skip-added` 对每一行新增的 `skipTest(...)` 或 `skipUnless(...)` 都报，只是按环境跳过（以 root 运行、没有信号量的沙箱）的也报，
+    只改了提示文字的行也报，因为改写后的那一行和原来的文本不同。
+  - 读整个钩子和 CI 文件的规则，对重构过的工作流（job 改名、一个步骤挪到另一个 job、矩阵变了）每个被删的行报一次；读过的几例里，
+    没有哪个检查被关掉。
 
 ## 模板
 
