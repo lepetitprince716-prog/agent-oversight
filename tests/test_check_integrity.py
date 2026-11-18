@@ -2735,8 +2735,8 @@ class CiScanStep(unittest.TestCase):
         labels = [step[0] for step in jobs[scanning[0]][1]]
         self.assertEqual(len(labels), 3, labels)
         self.assertTrue(labels[0].startswith("uses: actions/checkout@"), labels)
-        self.assertTrue(labels[1].startswith("name: Privacy scan"), labels)
-        self.assertTrue(labels[2].startswith("name: Check-integrity scan"), labels)
+        self.assertTrue(labels[1].startswith("name: Check-integrity scan"), labels)
+        self.assertTrue(labels[2].startswith("name: Privacy scan"), labels)
         checkout = "\n".join(jobs[scanning[0]][1][0])
         self.assertIn("fetch-depth: 0", checkout)
         self.assertIn("persist-credentials: false", checkout)
@@ -2772,6 +2772,144 @@ class CiScanStep(unittest.TestCase):
         lines = [line.strip() for line in self.WORKFLOW_TEXT.splitlines() if line.strip().startswith("cancel-in-progress:")]
         self.assertEqual(lines, ["cancel-in-progress: ${{ github.event_name == 'pull_request' }}"])
 
+    @classmethod
+    def gate_steps(cls):
+        """The steps of the scanning job that run a script, in the order ci.yml lists them:
+        (name, script, runs_after_a_failure). A step runs after a failed one only when it says
+        `if: ${{ !cancelled() }}`, as GitHub decides it."""
+        jobs = cls.jobs()
+        steps = next(
+            job_steps
+            for _, job_steps in jobs.values()
+            if any(step[0].startswith("name: Check-integrity scan") for step in job_steps)
+        )
+        found = []
+        for step in steps:
+            if step[0].startswith("name: "):
+                name = step[0][len("name: ") :]
+                always = any(line.strip() == "if: ${{ !cancelled() }}" for line in step)
+                found.append((name, cls.step_script(name), always))
+        return found
+
+    def run_gates(self, **variables):
+        """Run the steps of the scanning job one after another the way GitHub does: {name: (exit
+        code, output)}, with no entry for a step that was skipped after a failure."""
+        results = {}
+        failed = False
+        for name, script, always in self.gate_steps():
+            if failed and not always:
+                continue
+            code, out = self.run_step(script=script, **variables)
+            results[name] = (code, out)
+            failed = failed or code != 0
+        return results
+
+    def test_the_commit_check_comes_before_the_privacy_scan_in_the_scanning_job(self):
+        names = [name for name, _, _ in self.gate_steps()]
+        self.assertEqual(len(names), 2, names)
+        commit_check = next(n for n, name in enumerate(names) if name.startswith("Check-integrity scan"))
+        privacy = next(n for n, name in enumerate(names) if name.startswith("Privacy scan"))
+        self.assertLess(commit_check, privacy, names)
+        always = {name: always for name, _, always in self.gate_steps()}
+        self.assertTrue(always[names[privacy]], "a commit finding must not hide a privacy finding")
+
+    PRIVACY_SCANNER_THAT_MOVES_THE_BASELINE = (
+        "import subprocess\n"
+        "subprocess.run(['git', 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)\n"
+        "print('privacy: clean')\n"
+    )
+
+    def test_a_pushed_privacy_scanner_that_moves_the_baseline_cannot_hide_the_commit_finding(self):
+        """The privacy step of a push runs tools/privacy_scan.py as the pushed commit has it. One
+        that moves origin/main to HEAD leaves nothing between the two for a step that comes
+        after it, so the commit check has to have run first. The order comes from ci.yml."""
+        self.repo.git("checkout", "-q", "-b", "trunk", self.base_sha)
+        trunk = self.repo.commit("Add a privacy scanner", tools__privacy_scan_py="print('privacy: clean')\n")
+        self.repo.git("checkout", "-q", "-b", "feature", trunk)
+        park = self.repo.commit("Park a test", tests__test_thing_py=skipped(BASE_TEST, "test_two"))
+        tip = self.repo.commit(
+            "Tidy the privacy scanner", tools__privacy_scan_py=self.PRIVACY_SCANNER_THAT_MOVES_THE_BASELINE
+        )
+        self.seed_baseline(trunk)
+        results = self.run_gates(REF="refs/heads/feature", BEFORE=self.ZERO, AFTER=tip)
+        commit_check = next(name for name in results if name.startswith("Check-integrity scan"))
+        code, out = results[commit_check]
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"{park[:7]} tests/test_thing.py", out)
+        self.assertIn("skip-added", out)
+        privacy = next(name for name in results if name.startswith("Privacy scan"))
+        self.assertEqual(results[privacy][0], 0, "the scanner of the pushed commit passes whatever it is shown")
+
+    def test_on_a_pull_request_the_privacy_scanner_is_the_base_branchs_not_the_one_the_change_brings(self):
+        base = self.privacy_repo()
+        self.seed_baseline(base)
+        self.repo.git("checkout", "-q", "-b", "feature", base)
+        self.repo.commit("Tidy the scanner", tools__privacy_scan_py="print('privacy: clean')\n")
+        tip = self.repo.commit("Leak an address", src__a_py="host = '192.168." + "1.20'\n")
+        script = self.step_script("Privacy scan")
+        pull_request = dict(BASE_REF="main", PR_HEAD=tip, REF="refs/pull/7/merge", AFTER=tip)
+        done = subprocess.run(
+            ["python3", "-I", "-B", "tools/privacy_scan.py", "--tracked"],
+            cwd=self.repo.root,
+            env=self.repo.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "privacy: clean"), "control: the pushed scanner passes")
+        code, out = self.run_step(script=script, **pull_request)
+        self.assertEqual(code, 1, out)
+        self.assertIn("src/a.py:1: lan_ip", out)
+
+    @staticmethod
+    def evaluate(expression, context):
+        """The one shape of GitHub expression the concurrency group uses: `a == 'x' && b || c`,
+        with context paths and quoted strings. `&&` and `||` give the value they stopped at, as
+        GitHub's do, not a boolean."""
+
+        def atom(text):
+            text = text.strip()
+            if "==" in text:
+                left, right = text.split("==")
+                return atom(left) == atom(right)
+            return text[1:-1] if text.startswith("'") else context[text]
+
+        def conjunction(text):
+            value = None
+            for part in text.split("&&"):
+                value = atom(part)
+                if not value:
+                    break
+            return value
+
+        value = None
+        for alternative in expression.split("||"):
+            value = conjunction(alternative)
+            if value:
+                break
+        return value
+
+    def concurrency_group(self, **context):
+        lines = [line.strip() for line in self.WORKFLOW_TEXT.splitlines() if line.startswith("  group:")]
+        self.assertEqual(len(lines), 1, lines)
+        match = re.fullmatch(r"group: (\S*)\$\{\{ (.+) \}\}", lines[0])
+        self.assertIsNotNone(match, lines[0])
+        return match.group(1) + str(self.evaluate(match.group(2), context))
+
+    def test_every_push_run_has_a_concurrency_group_of_its_own_and_a_pull_request_shares_one_per_ref(self):
+        def push(run_id, ref="refs/heads/feature"):
+            return self.concurrency_group(**{"github.event_name": "push", "github.ref": ref, "github.run_id": run_id})
+
+        def pull_request(run_id, ref="refs/pull/7/merge"):
+            return self.concurrency_group(
+                **{"github.event_name": "pull_request", "github.ref": ref, "github.run_id": run_id}
+            )
+
+        self.assertEqual(len({push("1001"), push("1002"), push("1003")}), 3, "three pushes to one branch")
+        self.assertEqual(pull_request("1001"), pull_request("1002"), "a newer run of a pull request replaces the older")
+        self.assertNotEqual(pull_request("1001"), pull_request("1002", ref="refs/pull/8/merge"))
+        self.assertNotEqual(pull_request("1001"), push("1001"))
+
     def stand_in_for_the_library(self, module):
         """A file in the runner's temp folder, where the step puts the scanner, that ends the
         process with status 0 as soon as the scanner imports the module it is named after."""
@@ -2802,9 +2940,10 @@ class CiScanStep(unittest.TestCase):
         self.assertIn("skip-added", out)
         self.assertIn("::warning::", out)
 
-    def test_a_module_planted_next_to_the_privacy_scanner_cannot_stand_in_for_the_standard_library(self):
-        # a repository of its own: the privacy scan reads the author of every commit, and the one
-        # of setUp is not on the list of allowed addresses
+    def privacy_repo(self):
+        """Swap self.repo for a repository of its own that holds the privacy scanner and its rules,
+        committed: the privacy scan reads the author of every commit, and the one of setUp is not
+        on the list of allowed addresses. Returns the sha of that commit."""
         (Path(self._tmp.name) / "privacy").mkdir()
         self.repo = Repo(Path(self._tmp.name) / "privacy")
         for name in ("privacy_scan.py", "privacy_rules.json"):
@@ -2814,7 +2953,10 @@ class CiScanStep(unittest.TestCase):
             GIT_COMMITTER_EMAIL="1+author@users.noreply.github.com",
             AGENT_OVERSIGHT_PRIVATE_RULES=str(self.runner_temp / "no-private-rules.json"),
         )
-        clean = self.repo.commit("Add the privacy scanner")
+        return self.repo.commit("Add the privacy scanner")
+
+    def test_a_module_planted_next_to_the_privacy_scanner_cannot_stand_in_for_the_standard_library(self):
+        clean = self.privacy_repo()
         self.seed_baseline(clean)
         script = self.step_script("Privacy scan")
         pull_request = dict(BASE_REF="main", PR_HEAD=clean, REF="refs/pull/7/merge")
@@ -4399,6 +4541,13 @@ class CheapSwitchOffs(RepoCase):
         self.assertEqual(code, 1, out + err)
         self.assertIn("check-file-weakened", out)
         self.assertIn("warning", err)
+
+    def test_a_floor_set_in_place_on_a_line_that_set_none_is_not_a_rewritten_floor(self):
+        self.repo.commit(pytest_ini="[pytest]\naddopts = --cov=pkg\n")
+        self.repo.commit(pytest_ini="[pytest]\naddopts = --cov=pkg --cov-fail-under=90\n")
+        code, out, _ = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.findings(), [])
 
     def test_weakens_reads_the_guard_it_is_given(self):
         guard = ci.load_rules(RULES).guard_lines

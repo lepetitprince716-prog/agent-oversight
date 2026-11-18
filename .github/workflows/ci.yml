@@ -8,17 +8,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # Only a pull request run is replaced by a newer one. A push is scanned from the old tip
-  # to the new one, so a cancelled push run would leave the commits it brought unscanned.
+  # A pull request is judged by its head commit alone, so a newer run replaces the older one
+  # and they share a group per ref. A push is scanned from the old tip to the new one, so a
+  # skipped run would leave the commits it brought unscanned: every push run gets a group of
+  # its own. Pushes could not share one with cancel-in-progress off either, because GitHub
+  # replaces a run that is still waiting in a group with the one queued after it.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The two scans judge a change, so they run in a job of their own with no step that runs
-  # code from the repository: the code being judged cannot reach them. The interpreter runs
+  # the repository's tests or build: those run apart, in the tests job. The interpreter runs
   # in isolated mode (-I), which keeps the scanner's own directory and the environment out
   # of the module search path, so a file dropped next to the scanner cannot stand in for a
   # standard library module.
+  #
+  # The check-integrity step comes first. On a pull request both scans use the base branch's
+  # scanner. On a push the privacy scan runs tools/privacy_scan.py as the pushed commit
+  # has it, and a scanner of that kind can move origin/<default branch> to HEAD, which would
+  # leave a check-integrity step that ran after it with no commits to scan. So the commit
+  # check, which takes its scanner from the baseline, has judged the push by then, and a
+  # change to the privacy scanner is itself a finding of that check (check-machinery-changed).
+  # The privacy step runs even when the step before it failed, so a privacy finding is never
+  # hidden behind an unrelated commit finding.
   gates:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -30,22 +42,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0 # the privacy scan reads the whole history
           persist-credentials: false
-      - name: Privacy scan of the tree and the whole history
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          scanner=tools/privacy_scan.py
-          rules=tools/privacy_rules.json
-          if [ -n "$BASE_REF" ]; then
-            # On a pull request the scanner and its rules come from the base branch,
-            # so a change cannot loosen the rules it is judged by. This file runs as
-            # the pull request has it: read a change to it before merging.
-            git show "origin/$BASE_REF:tools/privacy_scan.py" > "$RUNNER_TEMP/privacy_scan.py"
-            git show "origin/$BASE_REF:tools/privacy_rules.json" > "$RUNNER_TEMP/privacy_rules.json"
-            scanner="$RUNNER_TEMP/privacy_scan.py"
-            rules="$RUNNER_TEMP/privacy_rules.json"
-          fi
-          python3 -I -B "$scanner" --rules "$rules" --tracked --history
       - name: Check-integrity scan of the commits being added
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -124,6 +120,23 @@ jobs:
             exit 0
           fi
           exit "$code"
+      - name: Privacy scan of the tree and the whole history
+        if: ${{ !cancelled() }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          scanner=tools/privacy_scan.py
+          rules=tools/privacy_rules.json
+          if [ -n "$BASE_REF" ]; then
+            # On a pull request the scanner and its rules come from the base branch,
+            # so a change cannot loosen the rules it is judged by. This file runs as
+            # the pull request has it: read a change to it before merging.
+            git show "origin/$BASE_REF:tools/privacy_scan.py" > "$RUNNER_TEMP/privacy_scan.py"
+            git show "origin/$BASE_REF:tools/privacy_rules.json" > "$RUNNER_TEMP/privacy_rules.json"
+            scanner="$RUNNER_TEMP/privacy_scan.py"
+            rules="$RUNNER_TEMP/privacy_rules.json"
+          fi
+          python3 -I -B "$scanner" --rules "$rules" --tracked --history
 
   # The repository's own tests run code from the repository, so they run apart from the scans.
   tests:
