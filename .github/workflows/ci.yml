@@ -56,11 +56,27 @@ jobs:
           overlay=""
           mode=--range
           on_default=no
+          # A branch is named by its full ref and turned into a commit id once; only that id is
+          # used after. git reads a short name such as origin/main as refs/tags/origin/main before
+          # refs/remotes/origin/main, and the checkout fetches every tag, so a pushed tag of that
+          # name would otherwise stand in for the branch: an empty range that passes, or a commit
+          # with a scanner of the tag author's choosing as the judge.
+          branch_commit() {
+            git rev-parse --verify --quiet --end-of-options "refs/remotes/origin/$1^{commit}"
+          }
           if [ -n "$BASE_REF" ]; then
+            judge=$(branch_commit "$BASE_REF") || {
+              echo "check-integrity: refs/remotes/origin/$BASE_REF, the base branch of the pull request, is not in this clone"
+              exit 2
+            }
             # The head commit of the pull request, not the merge commit CI checks out: the
             # merge commit has no Check-change line and would be judged as a whole.
-            judge="origin/$BASE_REF"
-            target="origin/$BASE_REF..$PR_HEAD"
+            target="$judge..$PR_HEAD"
+            if [ "$(git rev-list --count "$target")" = 0 ]; then
+              # A range with nothing in it is never a pass: there is nothing to judge.
+              echo "check-integrity: the pull request brings no commit beyond its base $BASE_REF ($judge), so there is nothing to judge"
+              exit 1
+            fi
           else
             if [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
               # The push has already landed, so a finding cannot stop it, and a pull request
@@ -69,7 +85,10 @@ jobs:
               on_default=yes
               judge="$BEFORE"
             else
-              judge="origin/$DEFAULT_BRANCH"
+              judge=$(branch_commit "$DEFAULT_BRANCH") || {
+                echo "check-integrity: refs/remotes/origin/$DEFAULT_BRANCH, the default branch, is not in this clone"
+                exit 2
+              }
             fi
             case "$BEFORE" in
               *[!0]*) first=no ;;
@@ -83,12 +102,12 @@ jobs:
             elif [ "$on_default" = yes ]; then
               echo "check-integrity: nothing to scan on this push to the default branch ($DEFAULT_BRANCH): the repository's first push, or the old tip is not in this clone (a force push)"
               exit 0
-            elif base=$(git merge-base "origin/$DEFAULT_BRANCH" "$AFTER" 2>/dev/null); then
+            elif base=$(git merge-base "$judge" "$AFTER" 2>/dev/null); then
               # A new branch or a force push brings every commit the branch has beyond the
               # default branch, not only the tip.
               target="$base..$AFTER"
             else
-              echo "check-integrity: $AFTER has no common history with origin/$DEFAULT_BRANCH, so only the top commit is scanned"
+              echo "check-integrity: $AFTER has no common history with origin/$DEFAULT_BRANCH ($judge), so only the top commit is scanned"
               mode=--commit
               target="$AFTER"
             fi
@@ -130,9 +149,14 @@ jobs:
           if [ -n "$BASE_REF" ]; then
             # On a pull request the scanner and its rules come from the base branch,
             # so a change cannot loosen the rules it is judged by. This file runs as
-            # the pull request has it: read a change to it before merging.
-            git show "origin/$BASE_REF:tools/privacy_scan.py" > "$RUNNER_TEMP/privacy_scan.py"
-            git show "origin/$BASE_REF:tools/privacy_rules.json" > "$RUNNER_TEMP/privacy_rules.json"
+            # the pull request has it: read a change to it before merging. The branch is
+            # named by its full ref, so a tag called origin/<base> cannot stand in for it.
+            base=$(git rev-parse --verify --quiet --end-of-options "refs/remotes/origin/$BASE_REF^{commit}") || {
+              echo "privacy_scan: error: refs/remotes/origin/$BASE_REF, the base branch of the pull request, is not in this clone"
+              exit 2
+            }
+            git show "$base:tools/privacy_scan.py" > "$RUNNER_TEMP/privacy_scan.py"
+            git show "$base:tools/privacy_rules.json" > "$RUNNER_TEMP/privacy_rules.json"
             scanner="$RUNNER_TEMP/privacy_scan.py"
             rules="$RUNNER_TEMP/privacy_rules.json"
           fi

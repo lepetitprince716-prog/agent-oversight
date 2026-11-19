@@ -23,7 +23,13 @@ that does not exist is a usage error.
 A merge commit is judged by what the merge changed beyond the automatic merge (``git show
 --remerge-diff``, git 2.36 or newer). ``--staged`` judges a merge that waits to be committed
 (``MERGE_HEAD`` exists) the same way: the index against the automatic merge of HEAD and the
-merged commit (``git merge-tree --write-tree``, git 2.38 or newer). Conflict markers that the
+merged commit (``git merge-tree --write-tree``, git 2.38 or newer). Either way the automatic
+merge is rebuilt with no ``.gitattributes`` file at all, neither the working tree's nor a
+commit's (``git --attr-source`` with the empty tree, git 2.41 or newer; see
+``no_tree_attributes``): in CI the working tree is the judged change's own head, and a merge
+attribute there (``union``, ``-merge``, ``binary``) would otherwise shape the merge the result is
+compared with, so a resolution that drops one side's lines would match it and pass. It is judged
+even where such an attribute would have kept one side. Conflict markers that the
 resolution removes are not findings. More than one merged commit is an ``unreadable-change``.
 The files that run the checks (hooks, CI workflows, this scanner, the privacy scanner and their rules
 files; class ``machinery`` of the rules file) are judged as a whole: a line added or removed, a new,
@@ -39,8 +45,11 @@ of the rules file: a coverage threshold) and the new text differs at all. A test
 test runners collect to one they do not is reported like a deletion (``test-removed``; see ``gone``).
 
 Every git call pins the configuration, attributes and environment that change diff text
-(``GIT_CONFIG``, ``GIT_ENV_DROP``, ``DIFF_FLAGS``), so the verdict does not depend on the clone
-it runs in. A change the scanner cannot read (a patch it cannot parse, a submodule, an octopus
+(``GIT_CONFIG``, ``GIT_ENV_DROP``, ``DIFF_FLAGS``, and for a merge ``no_tree_attributes``), so the
+verdict depends neither on the configuration of the clone it runs in nor on the attributes the
+judged change brings. The clone's own ``$GIT_DIR/info/attributes`` and ``core.attributesFile``
+still apply to a merge: they belong to whoever runs the scan, not to the change. A change the
+scanner cannot read (a patch it cannot parse, a submodule, an octopus
 merge) is a blocking finding, rule ``unreadable-change``: never a pass and never a crash. A file
 whose type changes (a regular file becomes a symbolic link, or the reverse) counts as the old
 file deleted; the new side is not judged.
@@ -595,7 +604,8 @@ def git(args: list[str]) -> bytes:
     done = run_git(args)
     if done.returncode != 0:
         detail = done.stderr.decode("utf-8", "replace").strip()
-        raise IntegrityError(f"git {args[0]} failed: {detail}")
+        name = next((arg for arg in args if not arg.startswith("-")), args[0])  # past a global option
+        raise IntegrityError(f"git {name} failed: {detail}")
     return done.stdout
 
 
@@ -697,7 +707,9 @@ def collect(base: list[str], merge: bool = False, markers: bool = False) -> list
     ``markers`` is for a diff against an automatic merge that had conflicts: the conflict
     markers that the resolution removed are left out of the removed lines, as they are
     not content the author dropped (a merge commit always has them left out)."""
-    command = ["show", "--format=", "--remerge-diff"] if merge else ["diff"]
+    # Only the merge rebuilds anything with attributes: a plain diff does not merge, and the
+    # --text --no-textconv --no-ext-diff of DIFF_FLAGS already pin what attributes change there.
+    command = [no_tree_attributes(), "show", "--format=", "--remerge-diff"] if merge else ["diff"]
     changes = changed_files(command, base)
     names = sorted({name for change in changes for name in (change.path, change.old_path) if name})
     return [read_change(command, base, change, merge or markers, names) for change in changes]
@@ -730,6 +742,26 @@ def empty_tree() -> str:
     if done.returncode != 0:
         raise IntegrityError(f"git hash-object failed: {done.stderr.decode('utf-8', 'replace').strip()}")
     return done.stdout.decode("ascii").strip()
+
+
+@functools.lru_cache(maxsize=None)
+def no_tree_attributes() -> str:
+    """The global option that makes git read ``.gitattributes`` from the empty tree, so it sees
+    none: put first in every call that merges. A merge is otherwise rebuilt with the attributes
+    of the working tree, which in CI is the judged change's own head; a ``.gitattributes`` there
+    that sets ``-merge``, ``merge=binary`` or ``merge=union`` on a file would shape the automatic
+    merge the result is compared with, and a resolution that drops one side's lines would show
+    no difference from it. The option is new in git 2.41; a git that does not know it ends the run
+    instead of judging the merge with the change's own attributes."""
+    option = f"--attr-source={empty_tree()}"
+    done = run_git([option, "rev-parse", "--git-dir"])
+    if done.returncode != 0:
+        detail = done.stderr.decode("utf-8", "replace").strip()
+        raise IntegrityError(
+            f"judging a merge needs a git that knows --attr-source (git 2.41 or newer), so the "
+            f"merge is not rebuilt with the attributes of the change under judgment: {detail}"
+        )
+    return option
 
 
 def resolve(rev: str) -> str:
@@ -779,7 +811,10 @@ def collect_staged() -> list[FileDiff]:
     if len(heads) > 1:
         return octopus(len(heads) + 1, "git has no automatic merge of it to compare the result with")
     require_git(MERGE_TREE_GIT, "judging a merge in progress with git merge-tree --write-tree")
-    done = run_git(["merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", "HEAD", heads[0]])
+    attributes = no_tree_attributes()  # see there: the working tree's .gitattributes must not shape the merge
+    done = run_git(
+        [attributes, "merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", "HEAD", heads[0]]
+    )
     # exit 0: merged cleanly; exit 1: conflicts, the tree holds them as markers; either way line 1 is the tree
     first = done.stdout.split(b"\n", 1)[0].decode("ascii", "replace").strip()
     if done.returncode not in (0, 1) or not OBJECT_ID.fullmatch(first):

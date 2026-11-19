@@ -227,9 +227,19 @@ merge; the conflict markers a resolution removes are not. This needs git 2.36 or
 older git the run exits 2 and says so, instead of judging the merge some other way. An octopus
 merge (three or more parents, which git cannot remerge-diff) is one `unreadable-change` finding.
 
+The automatic merge is rebuilt with no `.gitattributes` file at all, neither the working tree's
+nor a commit's (`git --attr-source` pointed at the empty tree, which needs git 2.41 or newer, else
+exit 2). In CI the working tree is the judged change's own head, so without this a merge attribute
+the change brings (`union`, `-merge`, `binary`) would shape the merge the result is compared with,
+and a resolution that drops one side's lines would match it and pass. A merge that drops one
+side's lines is judged even where such an attribute would have kept one side. The clone's own
+`.git/info/attributes` and `core.attributesFile` still apply: they belong to whoever runs the
+scan, not to the change.
+
 `--staged` judges a merge the same way while it waits to be committed (a `MERGE_HEAD` exists,
 whether after a conflict or `git merge --no-commit`): it compares the staged result with the
-automatic merge (`git merge-tree --write-tree`, git 2.38 or newer, else exit 2) instead of with
+automatic merge (`git merge-tree --write-tree`, git 2.38 or newer, else exit 2; rebuilt without
+`.gitattributes` as above) instead of with
 `HEAD`, so a clean merge does not make the commit-msg hook ask for the reasons of the commits it
 brings in, and only what the resolution changed is judged. Conflict markers that the resolution
 removes are not findings. A merge in progress with more than two parents is one
@@ -318,7 +328,12 @@ step still runs when this one failed. This scan takes its scanner, its rules and
 pull request, the default branch for a push to another branch, the old tip for a push to the
 default branch (a baseline without a scanner is judged by the copy in the change itself). The
 privacy scan does the same on a pull request only; on a push it runs the pushed commit's own
-scanner. A pull request scans the commits it adds; a new branch
+scanner. Both steps name the base or default branch by its full ref
+(`refs/remotes/origin/<branch>`) and turn it into a commit id once, because git reads a short
+`origin/<branch>` as a tag of that name first and the checkout fetches every tag: a pushed tag
+`origin/main` must not stand in for the branch. A branch that is not in the clone stops the step
+with exit 2. A pull request scans the commits it adds; one that adds none beyond its base fails
+the step (exit 1), because an empty range must never pass as ok. A new branch
 or a force push scans every commit from its merge base with the default branch, and only the top
 commit when there is none. A push to the default branch scans the commits it brings, but a
 finding there is a warning and the step passes (the push has landed, and a squash merge leaves

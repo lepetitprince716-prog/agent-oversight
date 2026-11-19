@@ -38,7 +38,8 @@ was not enough.
    GitHub makes for the run: that commit is written with the web identity of the account that
    opened the pull request, whose address is not on the allowed list. The scanner and its rules
    are taken from the base branch on a pull request, so a change cannot loosen the rules it is
-   judged by; on a push the scan runs the scanner of the pushed commit, and the commit check,
+   judged by (the branch is named by its full ref, so a tag of the same name cannot stand in for
+   it); on a push the scan runs the scanner of the pushed commit, and the commit check,
    which runs first, reports a change to it. A change can still edit the workflow file, and
    GitHub runs the changed copy of that, on the pull request and again after the merge. The
    commit check reports such a change while the change leaves that step working; one that

@@ -1018,6 +1018,32 @@ def skipped(text, name="test_one"):
     return text.replace(f"    def {name}", f"    @unittest.skip('x')\n    def {name}")
 
 
+MERGE_ATTRIBUTES = ("-merge", "merge=binary")
+
+
+def git_without_attr_source(case):
+    """Put a git first on the PATH of case.repo that refuses --attr-source as an unknown option,
+    the way a git older than 2.41 does, and passes everything else to the real git."""
+    shim = Path(case._tmp.name).parent / f"{Path(case._tmp.name).name}-noattrsource"
+    shim.mkdir()
+    case.addCleanup(lambda: shutil.rmtree(shim, ignore_errors=True))
+    (shim / "git").write_text(
+        '#!/bin/sh\nfor arg in "$@"; do\n'
+        '  case "$arg" in --attr-source*) echo "unknown option: $arg" >&2; exit 129 ;; esac\n'
+        f'done\nexec {shlex.quote(shutil.which("git"))} "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    case.repo.env["PATH"] = f"{shim}{os.pathsep}{case.repo.env['PATH']}"
+
+
+# The judged branch adds a test of its own at the end of the file; the other side adds an
+# assertion to test_one. Both sides changed the file, so a merge attribute decides the merge.
+ASSERTED_TEST = BASE_TEST.replace(
+    "        self.assertEqual(f(), 1)\n", "        self.assertEqual(f(), 1)\n        self.assertTrue(f())\n"
+)
+EXTRA_TEST = BASE_TEST + "\n    def test_three(self):\n        assert 3 == 3\n"
+
+
 class MergeCommits(RepoCase):
     """A merge commit is judged by what the merge changed beyond the automatic merge
     (git show --remerge-diff), not by everything the merged-in side brought."""
@@ -1140,6 +1166,38 @@ class MergeCommits(RepoCase):
         self.assertIn("2.36", err)
         code, _, _ = self.repo.scan("--commit", "HEAD^2")  # the side commit: one parent
         self.assertEqual(code, 0, "a commit with one parent needs no remerge-diff")
+
+    def test_a_merge_attribute_the_change_brings_cannot_hide_an_assertion_the_resolution_drops(self):
+        """In CI the working tree is the judged change's head. A .gitattributes there that keeps
+        one side of a file (-merge, merge=binary) must not shape the automatic merge the result is
+        compared with: the resolution below drops main's assertion and must be reported."""
+        for attribute in MERGE_ATTRIBUTES:
+            with self.subTest(attribute=attribute):
+                self.setUp()
+                self.repo.commit("Assert more", tests__test_s_py=ASSERTED_TEST)
+                self.branch_off("topic")
+                self.repo.commit(
+                    "Keep the tests of this branch",
+                    tests___gitattributes=f"test_s.py {attribute}\n",
+                    tests__test_s_py=EXTRA_TEST,
+                )
+                self.repo.git("merge", "-q", "--no-ff", "--no-commit", "main", check=False)
+                self.repo.commit("Merge main", tests__test_s_py=EXTRA_TEST)
+                self.assertTrue((self.repo.root / "tests" / ".gitattributes").exists(), "the working tree has it")
+                code, report = self.head_json()
+                found = {(f["path"], f["rule"], f["justified"]) for f in report["findings"]}
+                self.assertEqual((code, found), (1, {("tests/test_s.py", "assertion-loss", False)}))
+
+    def test_a_git_without_attr_source_exits_2_on_a_merge_and_names_the_option(self):
+        self.branch_off()
+        self.repo.commit("Side", src__b_py="b = 1\n")
+        self.merge()
+        git_without_attr_source(self)
+        code, out, err = self.repo.scan("--commit", "HEAD")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("--attr-source", err)
+        code, out, err = self.repo.scan("--commit", "HEAD^2")  # the side commit: one parent
+        self.assertEqual(code, 0, "a commit with one parent merges nothing:\n" + out + err)
 
 
 class StagedMerge(RepoCase):
@@ -1294,6 +1352,30 @@ class StagedMerge(RepoCase):
         code, out, err = self.repo.scan("--staged")
         self.assertEqual(code, 2, out)
         self.assertIn("MERGE_HEAD", err)
+
+    def test_a_merge_attribute_in_the_working_tree_cannot_hide_an_assertion_the_resolution_drops(self):
+        for attribute in MERGE_ATTRIBUTES:
+            with self.subTest(attribute=attribute):
+                self.setUp()
+                self.repo.commit("Assert more", tests__test_s_py=ASSERTED_TEST)
+                self.repo.git("checkout", "-q", "-b", "topic", self.base)
+                self.repo.commit(
+                    "Keep the tests of this branch",
+                    tests___gitattributes=f"test_s.py {attribute}\n",
+                    tests__test_s_py=EXTRA_TEST,
+                )
+                self.repo.git("merge", "-q", "--no-ff", "--no-commit", "main", check=False)
+                self.repo.write("tests/test_s.py", EXTRA_TEST)
+                self.repo.git("add", "-A")
+                self.assertEqual(self.staged(), (1, {("tests/test_s.py", "assertion-loss", False)}))
+
+    def test_a_git_without_attr_source_exits_2_on_a_merge_in_progress(self):
+        self.side(src__b_py="b = 1\n")
+        self.start_merge("side")
+        git_without_attr_source(self)
+        code, out, err = self.repo.scan("--staged")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("--attr-source", err)
 
 
 class RangeAndErrors(RepoCase):
@@ -2582,6 +2664,7 @@ class CiScanStep(unittest.TestCase):
         self.assertIn("skip-added", out)
 
     def test_the_default_branch_comes_from_the_repository_not_from_the_script(self):
+        self.repo.git("update-ref", "refs/remotes/origin/trunk", self.base_sha)  # the clone has every branch
         code, out = self.run_step(DEFAULT_BRANCH="trunk")
         self.assertEqual(code, 1, "main is an ordinary branch here:\n" + out)
         code, out = self.run_step(DEFAULT_BRANCH="trunk", REF="refs/heads/trunk")
@@ -2701,6 +2784,59 @@ class CiScanStep(unittest.TestCase):
         }
         _, tip = self.feature(("Add the scanner", scanner), base=bare)
         self.assert_blocked_everywhere(tip, bare)
+
+    def tag_as_the_base_branch(self, commit):
+        """A tag named like the remote branch: git reads the short name origin/main as this tag."""
+        self.repo.git("tag", "origin/main", commit)
+
+    BY_THE_BRANCH = ("a pull request", "the first push of a branch", "a force push")
+
+    def test_a_tag_named_like_the_base_branch_at_the_change_does_not_empty_the_range(self):
+        _, tip = self.feature()
+        self.tag_as_the_base_branch(tip)
+        entries = self.entries(tip, self.base_sha)
+        for kind in self.BY_THE_BRANCH:
+            with self.subTest(kind):
+                result, out = self.outcome(kind, *entries[kind])
+                self.assertEqual(result, "blocked", out)
+                self.assertIn("skip-added", out)
+
+    def test_a_tag_named_like_the_base_branch_cannot_bring_a_scanner_of_its_own(self):
+        self.repo.git("checkout", "-q", "-b", "decoy", self.base_sha)
+        decoy = self.repo.commit("A scanner that passes everything", tools__check_integrity_py="import sys\nsys.exit(0)\n")
+        _, tip = self.feature()
+        self.tag_as_the_base_branch(decoy)
+        entries = self.entries(tip, self.base_sha)
+        for kind in self.BY_THE_BRANCH:
+            with self.subTest(kind):
+                result, out = self.outcome(kind, *entries[kind])
+                self.assertEqual(result, "blocked", out)
+                self.assertIn("skip-added", out)
+
+    def test_a_pull_request_that_brings_no_commit_beyond_its_base_is_not_a_pass(self):
+        for label, head in (("head is the base", self.bad), ("head is behind the base", self.base_sha)):
+            with self.subTest(label):
+                self.seed_baseline(self.bad)
+                code, out = self.run_step(BASE_REF="main", PR_HEAD=head, REF="refs/pull/7/merge", BEFORE="", AFTER=head)
+                self.assertEqual(code, 1, out)
+                self.assertIn("brings no commit beyond its base", out)
+                self.assertNotIn("ok (0 commits", out)
+
+    def test_a_base_branch_missing_from_the_clone_exits_2_even_with_a_tag_of_its_name(self):
+        _, tip = self.feature()
+        for label, tagged in (("no tag", False), ("a tag of its name", True)):
+            with self.subTest(label):
+                self.repo.git("update-ref", "-d", "refs/remotes/origin/main", check=False)
+                if tagged:
+                    self.tag_as_the_base_branch(tip)
+                for kind, variables in (
+                    ("a pull request", dict(BASE_REF="main", PR_HEAD=tip, REF="refs/pull/7/merge", BEFORE="", AFTER=tip)),
+                    ("the first push of a branch", dict(REF="refs/heads/feature", BEFORE=self.ZERO, AFTER=tip)),
+                ):
+                    with self.subTest(kind):
+                        code, out = self.run_step(**variables)
+                        self.assertEqual(code, 2, out)
+                        self.assertIn("refs/remotes/origin/main", out)
 
     WORKFLOW_TEXT = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
@@ -2968,6 +3104,23 @@ class CiScanStep(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("src/a.py:1: lan_ip", out)
         self.assert_the_stand_in_would_work("privacy_scan.py", "--rules", str(self.runner_temp / "privacy_rules.json"))
+
+    def test_on_a_pull_request_a_tag_named_like_the_base_branch_cannot_bring_the_privacy_scanner(self):
+        base = self.privacy_repo()
+        self.seed_baseline(base)
+        self.repo.git("checkout", "-q", "-b", "feature", base)
+        self.repo.commit("Tidy the scanner", tools__privacy_scan_py="print('privacy: clean')\n")
+        tip = self.repo.commit("Leak an address", src__a_py="host = '192.168." + "1.20'\n")
+        self.repo.git("tag", "origin/main", tip)
+        script = self.step_script("Privacy scan")
+        pull_request = dict(BASE_REF="main", PR_HEAD=tip, REF="refs/pull/7/merge", AFTER=tip)
+        code, out = self.run_step(script=script, **pull_request)
+        self.assertEqual(code, 1, out)
+        self.assertIn("src/a.py:1: lan_ip", out)
+        self.repo.git("update-ref", "-d", "refs/remotes/origin/main")
+        code, out = self.run_step(script=script, **pull_request)
+        self.assertEqual(code, 2, out)
+        self.assertIn("refs/remotes/origin/main", out)
 
 
 class PushRefs(RepoCase):
