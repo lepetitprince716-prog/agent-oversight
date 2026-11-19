@@ -60,9 +60,12 @@ jobs:
           # used after. git reads a short name such as origin/main as refs/tags/origin/main before
           # refs/remotes/origin/main, and the checkout fetches every tag, so a pushed tag of that
           # name would otherwise stand in for the branch: an empty range that passes, or a commit
-          # with a scanner of the tag author's choosing as the judge.
+          # with a scanner of the tag author's choosing as the judge. rev-parse looks a full name up
+          # the same way once the branch itself is missing (a tag called refs/remotes/origin/main
+          # would answer), so show-ref --verify, which takes the name exactly, finds the commit.
           branch_commit() {
-            git rev-parse --verify --quiet --end-of-options "refs/remotes/origin/$1^{commit}"
+            oid=$(git show-ref --verify --hash "refs/remotes/origin/$1" 2>/dev/null) || return 1
+            git rev-parse --verify --quiet --end-of-options "$oid^{commit}"
           }
           if [ -n "$BASE_REF" ]; then
             judge=$(branch_commit "$BASE_REF") || {
@@ -150,8 +153,10 @@ jobs:
             # On a pull request the scanner and its rules come from the base branch,
             # so a change cannot loosen the rules it is judged by. This file runs as
             # the pull request has it: read a change to it before merging. The branch is
-            # named by its full ref, so a tag called origin/<base> cannot stand in for it.
-            base=$(git rev-parse --verify --quiet --end-of-options "refs/remotes/origin/$BASE_REF^{commit}") || {
+            # named by its exact full ref (show-ref --verify), so a tag called origin/<base>
+            # or refs/remotes/origin/<base> cannot stand in for it.
+            base=$(git show-ref --verify --hash "refs/remotes/origin/$BASE_REF" 2>/dev/null) &&
+              base=$(git rev-parse --verify --quiet --end-of-options "$base^{commit}") || {
               echo "privacy_scan: error: refs/remotes/origin/$BASE_REF, the base branch of the pull request, is not in this clone"
               exit 2
             }

@@ -1196,6 +1196,7 @@ class MergeCommits(RepoCase):
         code, out, err = self.repo.scan("--commit", "HEAD")
         self.assertEqual(code, 2, out + err)
         self.assertIn("--attr-source", err)
+        self.assertIn("2.41", err)  # the version check speaks, not git's own unknown-option error
         code, out, err = self.repo.scan("--commit", "HEAD^2")  # the side commit: one parent
         self.assertEqual(code, 0, "a commit with one parent merges nothing:\n" + out + err)
 
@@ -1376,6 +1377,7 @@ class StagedMerge(RepoCase):
         code, out, err = self.repo.scan("--staged")
         self.assertEqual(code, 2, out + err)
         self.assertIn("--attr-source", err)
+        self.assertIn("2.41", err)  # the version check speaks, not git's own unknown-option error
 
 
 class RangeAndErrors(RepoCase):
@@ -2824,11 +2826,18 @@ class CiScanStep(unittest.TestCase):
 
     def test_a_base_branch_missing_from_the_clone_exits_2_even_with_a_tag_of_its_name(self):
         _, tip = self.feature()
-        for label, tagged in (("no tag", False), ("a tag of its name", True)):
+        # rev-parse looks even a full name up through refs/tags/ once the branch is missing, so a
+        # tag called refs/remotes/origin/main would answer for it.
+        tags = (
+            ("no tag", None),
+            ("a tag origin/main", "origin/main"),
+            ("a tag refs/remotes/origin/main", "refs/remotes/origin/main"),
+        )
+        for label, tag in tags:
             with self.subTest(label):
                 self.repo.git("update-ref", "-d", "refs/remotes/origin/main", check=False)
-                if tagged:
-                    self.tag_as_the_base_branch(tip)
+                if tag:
+                    self.repo.git("tag", "-f", tag, tip)
                 for kind, variables in (
                     ("a pull request", dict(BASE_REF="main", PR_HEAD=tip, REF="refs/pull/7/merge", BEFORE="", AFTER=tip)),
                     ("the first push of a branch", dict(REF="refs/heads/feature", BEFORE=self.ZERO, AFTER=tip)),
@@ -3118,9 +3127,13 @@ class CiScanStep(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("src/a.py:1: lan_ip", out)
         self.repo.git("update-ref", "-d", "refs/remotes/origin/main")
-        code, out = self.run_step(script=script, **pull_request)
-        self.assertEqual(code, 2, out)
-        self.assertIn("refs/remotes/origin/main", out)
+        for tag in (None, "refs/remotes/origin/main"):  # the second is looked up when the branch is missing
+            with self.subTest(tag=tag):
+                if tag:
+                    self.repo.git("tag", tag, tip)
+                code, out = self.run_step(script=script, **pull_request)
+                self.assertEqual(code, 2, out)
+                self.assertIn("refs/remotes/origin/main", out)
 
 
 class PushRefs(RepoCase):
